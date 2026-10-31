@@ -1,6 +1,8 @@
 import sys
 import logging
 import time
+import json
+import urllib.request
 from pathlib import Path
 from typing import List, Optional
 import strawberry
@@ -29,6 +31,58 @@ neo4j_driver = GraphDatabase.driver(
     settings.NEO4J_URI,
     auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
 )
+
+# ============================================================================
+# LLM Generation via Gemini API
+# ============================================================================
+
+def generate_llm_answer(question: str, context: str, graph_categories: list[str]) -> tuple[str, str]:
+    """
+    Tạo câu trả lời tự nhiên thông qua Gemini LLM API dựa trên Context đồ thị.
+    Nếu API gặp sự cố hoặc chưa cấu hình key, fallback an toàn sang Extractive synthesis.
+    """
+    if not settings.GEMINI_API_KEY:
+        fallback = f"Dựa trên cơ sở tri thức đồ thị:\n{context[:400]}..."
+        return fallback, "Extractive Fallback (No Gemini API key)"
+
+    prompt = f"""Bạn là trợ lý AI thông minh của nền tảng đồ thị tri thức SynapseRAG.
+Hãy trả lời câu hỏi của người dùng một cách mạch lạc, tự nhiên, chính xác dựa trên Ngữ cảnh được trích xuất từ Đồ thị tri thức (GraphRAG) dưới đây.
+
+[CÁC CHỦ ĐỀ LIÊN QUAN TRONG ĐỒ THỊ]:
+{', '.join(graph_categories) if graph_categories else 'Không có'}
+
+[NGỮ CẢNH TRI THỨC TRÍCH XUẤT]:
+{context}
+
+[CÂU HỎI]:
+{question}
+
+[YÊU CẦU]:
+- Trả lời bằng tiếng Việt, rõ ràng, gãy gọn, có cấu trúc.
+- Sử dụng trực tiếp thông tin trong ngữ cảnh.
+- Không bịa đặt thông tin nằm ngoài ngữ cảnh được cung cấp.
+"""
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 600
+        }
+    }
+
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers)
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            answer_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            return answer_text.strip(), f"Generative LLM ({settings.GEMINI_MODEL})"
+    except Exception as e:
+        logger.error(f"Lỗi khi gọi Gemini LLM API: {e}")
+        fallback = f"[Fallback trích xuất đồ thị]:\n{context[:400]}..."
+        return fallback, f"Extractive Fallback (Gemini call failed: {type(e).__name__})"
 
 # ============================================================================
 # GraphQL Schema Types
@@ -77,12 +131,7 @@ class DebugRAGAnswer:
 
 def _execute_rag_pipeline(question: str, top_k: int, collect_debug: bool = False):
     """
-    Thực thi pipeline tìm kiếm GraphRAG.
-    Trả về (answer_str, sources_list, debug_steps, total_duration_ms).
-    Đảm bảo:
-    - ask() gọi hàm này với collect_debug=False, giữ nguyên 100% format và logic cũ.
-    - debugAsk() gọi hàm này với collect_debug=True để thu thập trace chi tiết.
-    - An toàn: Không lộ API keys, passwords hay full vector raw data.
+    Thực thi pipeline tìm kiếm GraphRAG kết hợp Gemini LLM generation.
     """
     t_start = time.perf_counter()
     steps: List[DebugStep] = []
@@ -178,7 +227,7 @@ def _execute_rag_pipeline(question: str, top_k: int, collect_debug: bool = False
                         mentioned_articles=mentions
                     )
                 )
-                context_snippets.append(f"[{r['article_title']}] {r['text'].strip()}")
+                context_snippets.append(f"• [Nguồn: {r['article_title']} | Độ tương đồng: {r['score']:.2f}]\n{r['text'].strip()}")
 
         step2_dur = round((time.perf_counter() - step2_start) * 1000, 2)
         if collect_debug:
@@ -215,34 +264,31 @@ def _execute_rag_pipeline(question: str, top_k: int, collect_debug: bool = False
         return "Lỗi khi kết nối hoặc truy vấn Neo4j Graph Database.", [], steps, total_ms
 
     # ----------------------------------------------------
-    # BƯỚC 3: Xây dựng câu trả lời (Answer Synthesis Strategy)
+    # BƯỚC 3: Tạo câu trả lời tự nhiên qua LLM (Gemini API)
     # ----------------------------------------------------
     step3_start = time.perf_counter()
     if context_snippets:
-        primary_chunk = sources[0]
-        answer = (
-            f"Dựa trên cơ sở tri thức đồ thị SynapseRAG từ bài viết '{primary_chunk.article_title}':\n"
-            f"{primary_chunk.text.strip()}\n\n"
-            f"(Khám phá đồ thị: Chủ đề này liên quan đến danh mục [{', '.join(primary_chunk.related_categories)}])"
-        )
-        strategy_desc = "Extractive Synthesis (Trích xuất đoạn văn bản có điểm vector cao nhất kèm context quan hệ đồ thị; chưa dùng LLM generative)."
+        full_context = "\n\n".join(context_snippets)
+        answer, strategy_desc = generate_llm_answer(question, full_context, list(all_categories))
+        llm_used_flag = "true" if "Generative LLM" in strategy_desc else "false"
     else:
-        answer = "Rất tiếc, hệ thống chưa tìm thấy thông tin phù hợp trong đồ thị tri thức cho câu hỏi này."
+        answer = "Rất tiếc, hệ thống chưa tìm thấy thông tin phù hợp trong cơ sở tri thức đồ thị cho câu hỏi này."
         strategy_desc = "No match found (Không tìm thấy chunk đạt ngưỡng trong cơ sở tri thức)."
+        llm_used_flag = "false"
 
     step3_dur = round((time.perf_counter() - step3_start) * 1000, 2)
     if collect_debug:
         steps.append(
             DebugStep(
-                name="3. Answer Synthesis",
+                name="3. Answer Generation (LLM)",
                 status="SUCCESS",
                 duration_ms=step3_dur,
-                details=strategy_desc,
+                details=f"Chiến lược: {strategy_desc}",
                 metrics=[
-                    StepMetric(key="synthesis_strategy", value="Extractive from Top Chunk + Graph Metadata"),
-                    StepMetric(key="generative_llm_used", value="false"),
-                    StepMetric(key="context_snippets_count", value=str(len(context_snippets))),
-                    StepMetric(key="primary_source_article", value=sources[0].article_title if sources else "None")
+                    StepMetric(key="synthesis_strategy", value=strategy_desc),
+                    StepMetric(key="generative_llm_used", value=llm_used_flag),
+                    StepMetric(key="llm_model", value=settings.GEMINI_MODEL),
+                    StepMetric(key="context_chunks_fed", value=str(len(context_snippets)))
                 ]
             )
         )
@@ -261,10 +307,7 @@ class Query:
     def ask(self, question: str, top_k: int = 3) -> RAGAnswer:
         """
         Truy vấn GraphRAG chuẩn dành cho người dùng:
-        1. Embed câu hỏi thành vector 384-dims.
-        2. Vector Search trên Neo4j để tìm top_k Chunk gần nhất.
-        3. Graph Traversal: Mở rộng context qua quan hệ đồ thị (HAS_CHUNK, IN_CATEGORY, MENTIONS).
-        4. Tổng hợp câu trả lời kèm nguồn trích dẫn bài viết.
+        Vector search -> Graph Traversal -> LLM sinh câu trả lời tự nhiên kèm nguồn.
         """
         logger.info(f"🔍 [ask] Nhận câu hỏi: '{question}'")
         answer, sources, _, _ = _execute_rag_pipeline(question, top_k, collect_debug=False)
@@ -322,6 +365,7 @@ def health_check():
     return {
         "service": "SynapseRAG GraphQL Gateway",
         "status": "HEALTHY",
+        "llm_model": settings.GEMINI_MODEL,
         "debug_trace_enabled": settings.RAG_DEBUG_TRACE_ENABLED,
         "graphql_playground": "/graphql"
     }
