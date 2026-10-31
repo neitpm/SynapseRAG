@@ -6,6 +6,10 @@
 [![Graph & Vector: Neo4j](https://img.shields.io/badge/Graph%20%26%20Vector-Neo4j-008cc1.svg)](https://neo4j.com/)
 [![API: GraphQL](https://img.shields.io/badge/API-GraphQL-e535ab.svg)](https://graphql.org/)
 
+<p align="center">
+  <img src="assets/synapse-rag-architecture-3d.jpg" alt="SynapseRAG 3D Architecture Diagram" width="100%" style="border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);" />
+</p>
+
 **SynapseRAG** là hệ thống kiến trúc Microservices phân tán kết hợp **Event-Driven Streaming (Kafka / Redpanda)**, **Kho lưu trữ NoSQL thô (Apache Cassandra)**, **Đồ thị tri thức & Vector (Neo4j GraphRAG)** và **Cổng truy vấn linh hoạt (GraphQL API)**.
 
 ---
