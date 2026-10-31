@@ -56,55 +56,6 @@ Hệ thống áp dụng mô hình **Fan-out Architecture** qua Kafka topic `wiki
 
 ---
 
-## 📁 Cấu trúc thư mục Monorepo
-
-```text
-C:\Projects\Microsevice\
-├── .env.example                     # Biến môi trường mẫu chung
-├── .env                             # Biến môi trường hiện tại
-├── .gitignore
-├── docker-compose.yml               # Quản lý hạ tầng container (Redpanda Kafka, UI, DBs)
-├── README.md                        # Tài liệu hướng dẫn kiến trúc & vận hành
-│
-├── shared/                          # Module dùng chung (Data Contracts & Config tập trung)
-│   ├── __init__.py
-│   ├── config.py                    # Nạp biến môi trường tập trung
-│   └── schemas/
-│       ├── __init__.py
-│       └── wiki_message.py          # Pydantic schema contract (có schema_version, page_id,...)
-│
-├── services/                        # Các Microservices độc lập
-│   │
-│   ├── wiki-producer/               # Service 1: Thu thập Wikipedia -> Push vào Kafka [✅ ĐÃ HOÀN THÀNH]
-│   │   ├── config.py
-│   │   ├── requirements.txt
-│   │   └── main.py                  # Entrypoint nạp bài viết và đẩy Kafka
-│   │
-│   ├── cassandra-sink-worker/       # Service 2: Consume Kafka -> Ghi vào Cassandra Raw Data Lake
-│   │   ├── config.py
-│   │   ├── requirements.txt
-│   │   └── main.py
-│   │
-│   ├── ai-ingestion-worker/         # Service 3: Consume Kafka -> Chunking -> Embedding -> Neo4j
-│   │   ├── config.py
-│   │   ├── requirements.txt
-│   │   └── main.py
-│   │
-│   └── rag-graphql-gateway/         # Service 4: GraphQL API (FastAPI + Strawberry) + LLM RAG Pipeline
-│       ├── config.py
-│       ├── requirements.txt
-│       └── main.py
-│
-└── infrastructure/                  # Scripts khởi tạo database và hạ tầng
-    ├── neo4j/
-    │   ├── init-schema.cypher       # Script tạo Vector Index & Unique Constraints
-    │   └── apply_schema.py          # Python runner khởi tạo schema Neo4j
-    └── cassandra/
-        └── init-keyspace.cql        # CQL script tạo Keyspace & Table với Partition Key chuẩn
-```
-
----
-
 ## 🚀 Hướng dẫn vận hành nhanh
 
 ### 1. Khởi động hạ tầng Broker & Databases
