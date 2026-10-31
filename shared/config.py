@@ -27,4 +27,7 @@ class BaseSettings:
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     EMBEDDING_DIMENSION: int = int(os.getenv("EMBEDDING_DIMENSION", "384"))
 
+    # Debug Trace
+    RAG_DEBUG_TRACE_ENABLED: bool = os.getenv("RAG_DEBUG_TRACE_ENABLED", "true").lower() in ("true", "1", "yes")
+
 settings = BaseSettings()
