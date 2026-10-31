@@ -24,7 +24,7 @@ class AIIngestionWorker:
             "bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS,
             "group.id": "graphrag-ingestion-group-v2",
             "auto.offset.reset": "earliest",
-            "enable.auto.commit": True,
+            "enable.auto.commit": False,  # Manual commit chỉ khi lưu Neo4j thành công
         }
         self.consumer = Consumer(self.consumer_conf)
         self.topic = settings.KAFKA_TOPIC_WIKI_RAW
@@ -204,6 +204,7 @@ class AIIngestionWorker:
                 try:
                     payload = json.loads(msg.value().decode("utf-8"))
                     self.process_article(payload)
+                    self.consumer.commit(msg)  # Chỉ commit offset khi đã lưu thành công vào Neo4j
                     processed += 1
                 except Exception as e:
                     logger.error(f"Lỗi khi xử lý message: {e}", exc_info=True)
@@ -217,4 +218,5 @@ class AIIngestionWorker:
 
 if __name__ == "__main__":
     worker = AIIngestionWorker()
-    worker.run(max_messages=5)
+    worker.run()  # Mặc định max_messages=None -> Chạy liên tục
+

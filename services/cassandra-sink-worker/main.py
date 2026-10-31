@@ -30,7 +30,7 @@ class CassandraSinkWorker:
             "bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS,
             "group.id": "cassandra-sink-group-v1",
             "auto.offset.reset": "earliest",
-            "enable.auto.commit": True,
+            "enable.auto.commit": False,  # Manual commit chỉ khi ghi Cassandra thành công
         }
         self.consumer = Consumer(self.consumer_conf)
         self.topic = settings.KAFKA_TOPIC_WIKI_RAW
@@ -112,6 +112,7 @@ class CassandraSinkWorker:
                 payload = json.loads(raw_json_str)
 
                 self.store_raw_article(payload, raw_json_str)
+                self.consumer.commit(msg)  # Chỉ commit offset khi đã insert Cassandra thành công
                 processed += 1
 
         except KeyboardInterrupt:
