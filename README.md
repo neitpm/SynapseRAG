@@ -105,19 +105,6 @@ C:\Projects\Microsevice\
 
 ---
 
-## 🛠️ Trạng thái triển khai các thành phần
-
-| Thành phần | Trạng thái | Ghi chú kỹ thuật |
-| :--- | :---: | :--- |
-| **Monorepo & Shared Contract** | ✅ Xong | Đã chuẩn hóa `WikiArticleMessage` với versioning `1.0`. |
-| **Kafka / Redpanda Broker** | ✅ Đang chạy | Chạy qua WSL2 Docker, port `9092` kết nối ổn định từ Windows. |
-| **Service 1: `wiki-producer`** | ✅ Xong | Đã crawl bài viết Wikipedia & publish vào Kafka topic `wiki-raw-articles`. |
-| **Service 2: `cassandra-sink-worker`** | ✅ Xong | Consume Kafka, ghi bài viết thô vào Cassandra (`synapse_lake.raw_articles`), manual commit. |
-| **Service 3: `ai-ingestion-worker`** | ✅ Xong | Chunking 100% nội dung, embed 384-dims, lưu Neo4j 5.20 GraphRAG (Articles, Chunks, Categories, Mentions). |
-| **Service 4: `rag-graphql-gateway`** | ✅ Xong | GraphQL API tại `/graphql` với 2 query: `ask` (User) & `debugAsk` (Developer trace). |
-
----
-
 ## 🚀 Hướng dẫn vận hành nhanh
 
 ### 1. Khởi động hạ tầng Broker & Databases
