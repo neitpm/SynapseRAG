@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # 1. MESSAGE BROKER: Redpanda
+  # ============================================================================
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v23.3.10
+    container_name: graphrag-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v2.5.2
+    container_name: graphrag-redpanda-console
+    environment:
+      KAFKA_BROKERS: "redpanda:29092"
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # ============================================================================
+  # 2. GRAPH DATABASE: Neo4j 4.4 LTS (Ổn định tuyệt đối trên WSL2)
+  # ============================================================================
+  neo4j:
+    image: neo4j:4.4-community
+    container_name: graphrag-neo4j
+    ports:
+      - "7474:7474" # Neo4j Browser UI
+      - "7687:7687" # Bolt protocol
+    environment:
+      - NEO4J_AUTH=neo4j/graphrag_password123
+    volumes:
+      - neo4j_data:/data
+
+volumes:
+  redpanda_data:
+  neo4j_data:
