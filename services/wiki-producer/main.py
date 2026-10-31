@@ -1,13 +1,14 @@
+import sys
 import time
-import json
 import logging
 from typing import List
+from pathlib import Path
 import wikipediaapi
 from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic
 
-import sys
-from pathlib import Path
+# Đảm bảo in tiếng Việt trên console Windows chuẩn xác
+sys.stdout.reconfigure(encoding="utf-8")
 
 # Thêm root vào sys.path để import shared
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
@@ -20,32 +21,28 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("wiki-producer")
 
 class WikiKafkaProducer:
-    def __init__(self):
-        # 1. Khởi tạo Kafka Producer
+    def __init__(self, language: str = "vi"):
+        self.language = language
         self.producer_config = {
             "bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS,
             "client.id": "wiki-producer-service",
-            "acks": "all",  # Đảm bảo độ tin cậy ghi dữ liệu
+            "acks": "all",
         }
         self.producer = Producer(self.producer_config)
         self.topic = settings.KAFKA_TOPIC_WIKI_RAW
 
-        # 2. Khởi tạo Wikipedia API Client (User-Agent chuẩn theo quy định của Wikimedia)
         self.wiki = wikipediaapi.Wikipedia(
-            user_agent="GraphRAGBot/1.0 (contact@microservices.local)",
-            language="vi",  # Mặc định lấy bài viết tiếng Việt (có thể đổi sang 'en')
+            user_agent="SynapseRAG-Bot/1.0 (contact@synapserag.local)",
+            language=self.language,
             extract_format=wikipediaapi.ExtractFormat.WIKI
         )
-
         self._ensure_topic_exists()
 
     def _ensure_topic_exists(self):
-        """Tự động kiểm tra và tạo Kafka Topic nếu chưa tồn tại"""
         admin_client = AdminClient({"bootstrap.servers": settings.KAFKA_BOOTSTRAP_SERVERS})
         metadata = admin_client.list_topics(timeout=10)
-        
         if self.topic not in metadata.topics:
-            logger.info(f"Topic '{self.topic}' chưa tồn tại. Đang tiến hành tạo mới...")
+            logger.info(f"Topic '{self.topic}' chưa tồn tại. Đang tạo...")
             new_topic = NewTopic(self.topic, num_partitions=3, replication_factor=1)
             futures = admin_client.create_topics([new_topic])
             for topic, future in futures.items():
@@ -54,31 +51,25 @@ class WikiKafkaProducer:
                     logger.info(f"Đã tạo thành công topic '{topic}'!")
                 except Exception as e:
                     logger.warning(f"Không thể tạo topic {topic}: {e}")
-        else:
-            logger.info(f"Topic '{self.topic}' đã sẵn sàng.")
 
     def _delivery_report(self, err, msg):
-        """Callback thông báo kết quả gửi message vào Kafka"""
         if err is not None:
-            logger.error(f"Message delivery failed: {err}")
+            logger.error(f"❌ Gửi vào Kafka thất bại: {err}")
         else:
             logger.info(
-                f"Đã gửi thành công vào topic: {msg.topic()} | Partition: {msg.partition()} | Offset: {msg.offset()}"
+                f"✅ ĐÃ ĐẨY VÀO KAFKA THÀNH CÔNG! Topic: '{msg.topic()}' | Partition: {msg.partition()} | Offset: {msg.offset()}"
             )
 
     def fetch_and_publish(self, article_title: str) -> bool:
-        """Lấy một bài viết từ Wikipedia và đẩy vào Kafka"""
-        logger.info(f"Đang tìm nạp bài viết Wikipedia: '{article_title}'...")
+        logger.info(f"🌐 Đang cào bài viết từ Wikipedia: '{article_title}' ({self.language.upper()})...")
         page = self.wiki.page(article_title)
 
         if not page.exists():
-            logger.warning(f"Bài viết '{article_title}' không tồn tại trên Wikipedia!")
+            logger.warning(f"❌ Bài viết '{article_title}' không tồn tại trên Wikipedia!")
             return False
 
-        # Trích xuất categories
-        categories = [cat.replace("Category:", "") for cat in list(page.categories.keys())[:10]]
+        categories = [cat.replace("Category:", "").replace("Thể loại:", "") for cat in list(page.categories.keys())[:10]]
 
-        # Đóng gói dữ liệu theo Schema Contract
         message = WikiArticleMessage(
             schema_version="1.0",
             page_id=page.pageid,
@@ -88,12 +79,11 @@ class WikiKafkaProducer:
             summary=page.summary[:500] if page.summary else None,
             categories=categories,
             metadata={
-                "language": "vi",
+                "language": self.language,
                 "char_length": len(page.text)
             }
         )
 
-        # Gửi vào Kafka với Key là page_id
         payload = message.model_dump_json()
         self.producer.produce(
             topic=self.topic,
@@ -102,23 +92,17 @@ class WikiKafkaProducer:
             callback=self._delivery_report
         )
         self.producer.flush()
-        logger.info(f"Hoàn tất push bài viết: '{page.title}' ({len(page.text)} ký tự)")
+        logger.info(f"🎉 Hoàn tất cào và bắn vào Kafka: '{page.title}' ({len(page.text):,} ký tự)")
         return True
 
-    def publish_topics(self, titles: List[str]):
-        """Publish một danh sách bài viết"""
-        for title in titles:
-            self.fetch_and_publish(title)
-            time.sleep(1)  # Giãn cách để tránh rate limit của Wikipedia
-
 if __name__ == "__main__":
-    producer = WikiKafkaProducer()
-    # Danh sách các bài viết mẫu thuộc chủ đề Công nghệ & AI
-    sample_articles = [
-        "Trí tuệ nhân tạo",
-        "Học máy",
-        "Kiến trúc hướng dịch vụ",
-    ]
-    logger.info("Bắt đầu tiến trình nạp bài viết Wikipedia vào Kafka...")
-    producer.publish_topics(sample_articles)
-    logger.info("Hoàn tất tiến trình nạp bài viết!")
+    # Nhận từ khóa từ tham số terminal nếu có
+    if len(sys.argv) > 1:
+        target_title = sys.argv[1]
+        target_lang = sys.argv[2] if len(sys.argv) > 2 else "vi"
+    else:
+        target_title = "Điện toán đám mây"
+        target_lang = "vi"
+
+    producer = WikiKafkaProducer(language=target_lang)
+    producer.fetch_and_publish(target_title)

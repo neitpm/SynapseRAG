@@ -41,19 +41,41 @@ services:
         condition: service_healthy
 
   # ============================================================================
-  # 2. GRAPH DATABASE: Neo4j 4.4 LTS (Ổn định tuyệt đối trên WSL2)
+  # 2. GRAPH & VECTOR DATABASE: Neo4j 5.20+ (Hỗ trợ Vector Index)
   # ============================================================================
   neo4j:
-    image: neo4j:4.4-community
+    image: neo4j:5.20-community
     container_name: graphrag-neo4j
     ports:
       - "7474:7474" # Neo4j Browser UI
       - "7687:7687" # Bolt protocol
     environment:
       - NEO4J_AUTH=neo4j/graphrag_password123
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_server_memory_pagecache_size=512M
+      - NEO4J_server_memory_heap_initial__size=512M
+      - NEO4J_server_memory_heap_max__size=1G
     volumes:
       - neo4j_data:/data
+
+  # ============================================================================
+  # 3. RAW DATA LAKE: Cassandra (hoặc ScyllaDB tương thích CQL 100%)
+  # ============================================================================
+  cassandra:
+    image: cassandra:4.1
+    container_name: graphrag-cassandra
+    ports:
+      - "9042:9042" # CQL native transport port
+    environment:
+      - CASSANDRA_CLUSTER_NAME=SynapseCluster
+      - CASSANDRA_DC=datacenter1
+      - CASSANDRA_ENDPOINT_SNITCH=GossipingPropertyFileSnitch
+      - MAX_HEAP_SIZE=512M
+      - HEAP_NEWSIZE=128M
+    volumes:
+      - cassandra_data:/var/lib/cassandra
 
 volumes:
   redpanda_data:
   neo4j_data:
+  cassandra_data:
