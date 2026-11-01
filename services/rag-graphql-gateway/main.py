@@ -2,11 +2,14 @@ import sys
 import logging
 import time
 import json
+import asyncio
 import urllib.request
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, AsyncGenerator, Dict, Any
 import strawberry
-from fastapi import FastAPI
+from fastapi import FastAPI, Query as FastAPIQuery
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from strawberry.fastapi import GraphQLRouter
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
@@ -126,40 +129,78 @@ class DebugRAGAnswer:
     steps: List[DebugStep]
 
 # ============================================================================
-# Core Query Execution Helper
+# Unified Core Query Execution Helper (DÙNG CHUNG CHO CẢ GRAPHQL & SSE STREAM)
 # ============================================================================
 
-def _execute_rag_pipeline(question: str, top_k: int, collect_debug: bool = False):
+def execute_rag_pipeline(
+    question: str, 
+    top_k: int = 3, 
+    collect_debug: bool = False,
+    progress_callback: Optional[Any] = None
+) -> tuple[str, list[dict], list[DebugStep], float]:
     """
-    Thực thi pipeline tìm kiếm GraphRAG kết hợp Gemini LLM generation.
+    Pipeline cốt lõi duy nhất cho RAG:
+    - Bước 1: Embedding câu hỏi
+    - Bước 2: Neo4j Vector Search + Graph Traversal
+    - Bước 3: Gemini LLM Generation
+    Nếu có progress_callback, gọi callback đồng bộ theo từng event để SSE stream phát ra ngay lập tức.
     """
     t_start = time.perf_counter()
     steps: List[DebugStep] = []
-    sources: List[SourceChunk] = []
-    context_snippets: List[str] = []
+    sources: list[dict] = []
+    context_snippets: list[str] = []
+
+    def notify(event_type: str, data: dict):
+        if progress_callback:
+            progress_callback(event_type, data)
+
+    notify("pipeline_start", {
+        "question": question,
+        "top_k": top_k,
+        "timestamp": time.time(),
+        "active_node": "gateway"
+    })
 
     # ----------------------------------------------------
-    # BƯỚC 1: Embedding câu hỏi
+    # BƯỚC 1: Embedding câu hỏi (Bên trong Gateway)
     # ----------------------------------------------------
+    notify("step_start", {
+        "step_id": 1,
+        "name": "1. Question Embedding",
+        "active_node": "gateway",
+        "active_edge": "client_to_gateway",
+        "details": f"Gateway đang nhúng câu hỏi thành vector bằng mô hình '{settings.EMBEDDING_MODEL}'..."
+    })
+
     step1_start = time.perf_counter()
     q_vec = None
     try:
         q_vec = embedder.encode(question).tolist()
         step1_dur = round((time.perf_counter() - step1_start) * 1000, 2)
+        step_metrics = [
+            StepMetric(key="embedding_model", value=settings.EMBEDDING_MODEL),
+            StepMetric(key="vector_dimensions", value=str(len(q_vec))),
+            StepMetric(key="vector_preview", value=f"[{q_vec[0]:.4f}, {q_vec[1]:.4f}, ...]")
+        ]
         if collect_debug:
             steps.append(
                 DebugStep(
                     name="1. Question Embedding",
                     status="SUCCESS",
                     duration_ms=step1_dur,
-                    details=f"Sinh vector nhúng với mô hình cục bộ '{settings.EMBEDDING_MODEL}'.",
-                    metrics=[
-                        StepMetric(key="embedding_model", value=settings.EMBEDDING_MODEL),
-                        StepMetric(key="vector_dimensions", value=str(len(q_vec))),
-                        StepMetric(key="vector_preview", value=f"[{q_vec[0]:.4f}, {q_vec[1]:.4f}, ...]")
-                    ]
+                    details=f"Gateway hoàn tất sinh vector 384 chiều ({step1_dur}ms).",
+                    metrics=step_metrics
                 )
             )
+        notify("step_complete", {
+            "step_id": 1,
+            "name": "1. Question Embedding",
+            "status": "SUCCESS",
+            "duration_ms": step1_dur,
+            "active_node": "gateway",
+            "details": f"Vector 384 chiều đã sẵn sàng ({step1_dur}ms).",
+            "metrics": [{"key": m.key, "value": m.value} for m in step_metrics]
+        })
     except Exception as e:
         step1_dur = round((time.perf_counter() - step1_start) * 1000, 2)
         logger.error(f"Lỗi embedding câu hỏi: {e}")
@@ -173,24 +214,34 @@ def _execute_rag_pipeline(question: str, top_k: int, collect_debug: bool = False
                     metrics=[StepMetric(key="error", value="Embedding computation error")]
                 )
             )
+        notify("step_failed", {
+            "step_id": 1,
+            "name": "1. Question Embedding",
+            "status": "FAILED",
+            "duration_ms": step1_dur,
+            "error": "Lỗi khi sinh vector nhúng"
+        })
         total_ms = round((time.perf_counter() - t_start) * 1000, 2)
         return "Lỗi trong quá trình sinh vector nhúng cho câu hỏi.", [], steps, total_ms
 
     # ----------------------------------------------------
-    # BƯỚC 2: Vector Search & Graph Traversal (Neo4j)
+    # BƯỚC 2: Neo4j Vector Search & Graph Traversal
     # ----------------------------------------------------
+    notify("step_start", {
+        "step_id": 2,
+        "name": "2. Vector Search & Graph Traversal",
+        "active_node": "neo4j",
+        "active_edge": "gateway_to_neo4j",
+        "details": "Truy vấn Neo4j Index Vector và mở rộng đồ thị qua quan hệ HAS_CHUNK, IN_CATEGORY, MENTIONS..."
+    })
+
     step2_start = time.perf_counter()
     cypher = """
         CALL db.index.vector.queryNodes('chunk_vector_index', $top_k, $q_vec)
         YIELD node, score
         MATCH (a:Article)-[:HAS_CHUNK]->(node)
-        
-        // Mở rộng Graph Traversal: tìm category của bài viết
         OPTIONAL MATCH (a)-[:IN_CATEGORY]->(cat:Category)
-        
-        // Mở rộng Graph Traversal: tìm các bài viết được Chunk nhắc đến
         OPTIONAL MATCH (node)-[:MENTIONS]->(m:Article)
-        
         RETURN 
             node.chunk_id AS chunk_id,
             node.text AS text,
@@ -216,37 +267,45 @@ def _execute_rag_pipeline(question: str, top_k: int, collect_debug: bool = False
                 all_mentions.update(mentions)
                 all_articles.add(r["article_title"])
 
-                sources.append(
-                    SourceChunk(
-                        chunk_id=r["chunk_id"],
-                        article_title=r["article_title"],
-                        article_url=r["article_url"],
-                        score=round(r["score"], 4),
-                        text=r["text"],
-                        related_categories=cats[:3],
-                        mentioned_articles=mentions
-                    )
-                )
+                sources.append({
+                    "chunk_id": r["chunk_id"],
+                    "article_title": r["article_title"],
+                    "article_url": r["article_url"],
+                    "score": round(r["score"], 4),
+                    "text": r["text"],
+                    "related_categories": cats[:3],
+                    "mentioned_articles": mentions
+                })
                 context_snippets.append(f"• [Nguồn: {r['article_title']} | Độ tương đồng: {r['score']:.2f}]\n{r['text'].strip()}")
 
         step2_dur = round((time.perf_counter() - step2_start) * 1000, 2)
+        step2_metrics = [
+            StepMetric(key="top_k_requested", value=str(top_k)),
+            StepMetric(key="chunks_found", value=str(len(sources))),
+            StepMetric(key="articles_matched", value=", ".join(all_articles) if all_articles else "None"),
+            StepMetric(key="graph_categories_expanded", value=str(len(all_categories))),
+            StepMetric(key="graph_mentions_expanded", value=str(len(all_mentions))),
+            StepMetric(key="top_match_score", value=str(sources[0]["score"]) if sources else "0.0")
+        ]
         if collect_debug:
             steps.append(
                 DebugStep(
                     name="2. Vector Search & Graph Traversal",
                     status="SUCCESS",
                     duration_ms=step2_dur,
-                    details="Tìm kiếm vector top_k trên Neo4j index và mở rộng đồ thị qua quan hệ HAS_CHUNK, IN_CATEGORY, MENTIONS.",
-                    metrics=[
-                        StepMetric(key="top_k_requested", value=str(top_k)),
-                        StepMetric(key="chunks_found", value=str(len(sources))),
-                        StepMetric(key="articles_matched", value=", ".join(all_articles) if all_articles else "None"),
-                        StepMetric(key="graph_categories_expanded", value=str(len(all_categories))),
-                        StepMetric(key="graph_mentions_expanded", value=str(len(all_mentions))),
-                        StepMetric(key="top_match_score", value=str(sources[0].score) if sources else "0.0")
-                    ]
+                    details=f"Tìm thấy {len(sources)} chunks, mở rộng {len(all_categories)} categories và {len(all_mentions)} mentions ({step2_dur}ms).",
+                    metrics=step2_metrics
                 )
             )
+        notify("step_complete", {
+            "step_id": 2,
+            "name": "2. Vector Search & Graph Traversal",
+            "status": "SUCCESS",
+            "duration_ms": step2_dur,
+            "active_node": "neo4j",
+            "details": f"Tìm thấy {len(sources)} chunks và mở rộng đồ thị ({step2_dur}ms).",
+            "metrics": [{"key": m.key, "value": m.value} for m in step2_metrics]
+        })
     except Exception as e:
         step2_dur = round((time.perf_counter() - step2_start) * 1000, 2)
         logger.error(f"Lỗi truy vấn Neo4j GraphRAG: {e}")
@@ -260,12 +319,27 @@ def _execute_rag_pipeline(question: str, top_k: int, collect_debug: bool = False
                     metrics=[StepMetric(key="error", value="Database query error")]
                 )
             )
+        notify("step_failed", {
+            "step_id": 2,
+            "name": "2. Vector Search & Graph Traversal",
+            "status": "FAILED",
+            "duration_ms": step2_dur,
+            "error": "Lỗi truy vấn cơ sở dữ liệu đồ thị Neo4j."
+        })
         total_ms = round((time.perf_counter() - t_start) * 1000, 2)
         return "Lỗi khi kết nối hoặc truy vấn Neo4j Graph Database.", [], steps, total_ms
 
     # ----------------------------------------------------
     # BƯỚC 3: Tạo câu trả lời tự nhiên qua LLM (Gemini API)
     # ----------------------------------------------------
+    notify("step_start", {
+        "step_id": 3,
+        "name": "3. Answer Generation (LLM)",
+        "active_node": "gemini",
+        "active_edge": "neo4j_to_gemini",
+        "details": f"Gửi context đồ thị đến Google Gemini ({settings.GEMINI_MODEL}) tổng hợp câu trả lời tự nhiên..."
+    })
+
     step3_start = time.perf_counter()
     if context_snippets:
         full_context = "\n\n".join(context_snippets)
@@ -273,10 +347,16 @@ def _execute_rag_pipeline(question: str, top_k: int, collect_debug: bool = False
         llm_used_flag = "true" if "Generative LLM" in strategy_desc else "false"
     else:
         answer = "Rất tiếc, hệ thống chưa tìm thấy thông tin phù hợp trong cơ sở tri thức đồ thị cho câu hỏi này."
-        strategy_desc = "No match found (Không tìm thấy chunk đạt ngưỡng trong cơ sở tri thức)."
+        strategy_desc = "No match found"
         llm_used_flag = "false"
 
     step3_dur = round((time.perf_counter() - step3_start) * 1000, 2)
+    step3_metrics = [
+        StepMetric(key="synthesis_strategy", value=strategy_desc),
+        StepMetric(key="generative_llm_used", value=llm_used_flag),
+        StepMetric(key="llm_model", value=settings.GEMINI_MODEL),
+        StepMetric(key="context_chunks_fed", value=str(len(context_snippets)))
+    ]
     if collect_debug:
         steps.append(
             DebugStep(
@@ -284,16 +364,29 @@ def _execute_rag_pipeline(question: str, top_k: int, collect_debug: bool = False
                 status="SUCCESS",
                 duration_ms=step3_dur,
                 details=f"Chiến lược: {strategy_desc}",
-                metrics=[
-                    StepMetric(key="synthesis_strategy", value=strategy_desc),
-                    StepMetric(key="generative_llm_used", value=llm_used_flag),
-                    StepMetric(key="llm_model", value=settings.GEMINI_MODEL),
-                    StepMetric(key="context_chunks_fed", value=str(len(context_snippets)))
-                ]
+                metrics=step3_metrics
             )
         )
+    notify("step_complete", {
+        "step_id": 3,
+        "name": "3. Answer Generation (LLM)",
+        "status": "SUCCESS",
+        "duration_ms": step3_dur,
+        "active_node": "gemini",
+        "details": f"Hoàn tất sinh câu trả lời bằng {strategy_desc} ({step3_dur}ms).",
+        "metrics": [{"key": m.key, "value": m.value} for m in step3_metrics]
+    })
 
     total_ms = round((time.perf_counter() - t_start) * 1000, 2)
+    notify("pipeline_complete", {
+        "question": question,
+        "answer": answer,
+        "sources": sources,
+        "total_duration_ms": total_ms,
+        "active_node": "result",
+        "active_edge": "gemini_to_result"
+    })
+
     return answer, sources, steps, total_ms
 
 
@@ -310,7 +403,18 @@ class Query:
         Vector search -> Graph Traversal -> LLM sinh câu trả lời tự nhiên kèm nguồn.
         """
         logger.info(f"🔍 [ask] Nhận câu hỏi: '{question}'")
-        answer, sources, _, _ = _execute_rag_pipeline(question, top_k, collect_debug=False)
+        answer, raw_sources, _, _ = execute_rag_pipeline(question, top_k, collect_debug=False)
+        sources = [
+            SourceChunk(
+                chunk_id=s["chunk_id"],
+                article_title=s["article_title"],
+                article_url=s["article_url"],
+                score=s["score"],
+                text=s["text"],
+                related_categories=s["related_categories"],
+                mentioned_articles=s["mentioned_articles"]
+            ) for s in raw_sources
+        ]
         return RAGAnswer(
             question=question,
             answer=answer,
@@ -341,7 +445,18 @@ class Query:
             )
 
         logger.info(f"🛠️ [debugAsk] Nhận câu hỏi debug: '{question}'")
-        answer, sources, steps, total_ms = _execute_rag_pipeline(question, top_k, collect_debug=True)
+        answer, raw_sources, steps, total_ms = execute_rag_pipeline(question, top_k, collect_debug=True)
+        sources = [
+            SourceChunk(
+                chunk_id=s["chunk_id"],
+                article_title=s["article_title"],
+                article_url=s["article_url"],
+                score=s["score"],
+                text=s["text"],
+                related_categories=s["related_categories"],
+                mentioned_articles=s["mentioned_articles"]
+            ) for s in raw_sources
+        ]
         return DebugRAGAnswer(
             question=question,
             answer=answer,
@@ -351,13 +466,22 @@ class Query:
         )
 
 # ============================================================================
-# FastAPI App
+# FastAPI App & SSE Realtime Stream Endpoint
 # ============================================================================
 
 schema = strawberry.Schema(query=Query)
 graphql_app = GraphQLRouter(schema)
 
 app = FastAPI(title="SynapseRAG GraphQL Gateway", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(graphql_app, prefix="/graphql")
 
 @app.get("/")
@@ -369,6 +493,40 @@ def health_check():
         "debug_trace_enabled": settings.RAG_DEBUG_TRACE_ENABLED,
         "graphql_playground": "/graphql"
     }
+
+@app.get("/api/debug/ask/stream")
+async def stream_rag_debug(question: str = FastAPIQuery(..., description="Câu hỏi cần RAG"), top_k: int = 3):
+    """
+    SSE stream endpoint cho Developer UI, chạy cùng một hàm `execute_rag_pipeline` duy nhất.
+    """
+    event_queue: asyncio.Queue = asyncio.Queue()
+
+    def progress_callback(event_type: str, data: dict):
+        event_queue.put_nowait((event_type, data))
+
+    async def run_pipeline_task():
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: execute_rag_pipeline(
+                question=question, 
+                top_k=top_k, 
+                collect_debug=True, 
+                progress_callback=progress_callback
+            )
+        )
+        await event_queue.put(("DONE_STREAM", {}))
+
+    asyncio.create_task(run_pipeline_task())
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        while True:
+            event_type, data = await event_queue.get()
+            if event_type == "DONE_STREAM":
+                break
+            yield f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 if __name__ == "__main__":
     import uvicorn

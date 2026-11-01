@@ -87,7 +87,15 @@ python services/ai-ingestion-worker/main.py
 ```powershell
 python services/rag-graphql-gateway/main.py
 ```
-Truy cập GraphQL Playground tại: **[http://localhost:8000/graphql](http://localhost:8000/graphql)**
+* **GraphQL Playground:** [http://localhost:8000/graphql](http://localhost:8000/graphql)
+* **Real-time SSE Stream Endpoint:** `GET /api/debug/ask/stream?question=...&top_k=3`
+
+### 5. Khởi chạy Giao diện Developer 3D Explorer (`frontend`)
+```powershell
+cd frontend
+npm run dev
+```
+Truy cập giao diện tại: **[http://localhost:5173](http://localhost:5173)**. Giao diện cung cấp sơ đồ mạng 3D thời gian thực, timeline trace từng bước (Embedding -> Neo4j Vector/Graph -> Gemini LLM) và hiển thị trích dẫn nguồn Wikipedia.
 
 ---
 
