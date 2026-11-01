@@ -21,6 +21,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(ROOT_DIR))
 
 from shared.config import settings
+from wiki_dynamic import extract_keyword_candidate, fetch_and_store_wiki_on_demand
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rag-graphql-gateway")
@@ -279,6 +280,58 @@ def execute_rag_pipeline(
                 context_snippets.append(f"• [Nguồn: {r['article_title']} | Độ tương đồng: {r['score']:.2f}]\n{r['text'].strip()}")
 
         step2_dur = round((time.perf_counter() - step2_start) * 1000, 2)
+        top_score = sources[0]["score"] if sources else 0.0
+
+        # ON-DEMAND DYNAMIC CRAWL:
+        # Kiểm tra xem từ khóa của câu hỏi có khớp với tiêu đề bài viết nào trong đồ thị hay không
+        topic_candidate = extract_keyword_candidate(question)
+        has_matched_article = False
+        if topic_candidate:
+            cand_lower = topic_candidate.lower()
+            for art in all_articles:
+                if cand_lower in art.lower() or art.lower() in cand_lower:
+                    has_matched_article = True
+                    break
+
+        # Nếu chưa có bài viết cho chủ đề này hoặc không tìm thấy chunk nào
+        if len(sources) == 0 or not has_matched_article:
+            logger.info(f"🔍 Tri thức nội bộ chưa có bài viết trực tiếp cho '{topic_candidate}'. Thử tìm kiếm và nạp từ Wikipedia...")
+            notify("step_info", {
+                "step_id": 2,
+                "name": "Wikipedia On-Demand Crawl",
+                "active_node": "neo4j",
+                "details": f"Chưa có bài viết cho '{topic_candidate}' trong kho đồ thị. Đang tự động cào bài từ Wikipedia..."
+            })
+            
+            crawled, crawled_title, chunk_cnt = fetch_and_store_wiki_on_demand(topic_candidate, neo4j_driver, embedder)
+            if crawled:
+                logger.info(f"✨ Nạp thành công bài '{crawled_title}' ({chunk_cnt} chunks). Đang tái truy vấn đồ thị...")
+                # Truy vấn lại sau khi nạp bài mới
+                sources.clear()
+                context_snippets.clear()
+                all_categories.clear()
+                all_mentions.clear()
+                all_articles.clear()
+                with neo4j_driver.session() as session:
+                    re_results = session.run(cypher, {"q_vec": q_vec, "top_k": top_k}).data()
+                    for r in re_results:
+                        cats = [c for c in r["categories"] if c]
+                        mentions = [m for m in r["mentions"] if m]
+                        all_categories.update(cats)
+                        all_mentions.update(mentions)
+                        all_articles.add(r["article_title"])
+
+                        sources.append({
+                            "chunk_id": r["chunk_id"],
+                            "article_title": r["article_title"],
+                            "article_url": r["article_url"],
+                            "score": round(r["score"], 4),
+                            "text": r["text"],
+                            "related_categories": cats[:3],
+                            "mentioned_articles": mentions
+                        })
+                        context_snippets.append(f"• [Nguồn: {r['article_title']} | Độ tương đồng: {r['score']:.2f}]\n{r['text'].strip()}")
+
         step2_metrics = [
             StepMetric(key="top_k_requested", value=str(top_k)),
             StepMetric(key="chunks_found", value=str(len(sources))),
