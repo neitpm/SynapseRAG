@@ -16,7 +16,7 @@ interface Source {
 
 export const App: React.FC = () => {
   const [question, setQuestion] = useState('Trí tuệ nhân tạo là gì và ứng dụng ra sao?');
-  const [topK, setTopK] = useState(3);
+  const [topK, setTopK] = useState(5);
   const [loading, setLoading] = useState(false);
   const [activeNode, setActiveNode] = useState<string | null>(null);
   const [activeEdge, setActiveEdge] = useState<string | null>(null);

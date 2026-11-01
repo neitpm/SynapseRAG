@@ -62,9 +62,10 @@ Hãy trả lời câu hỏi của người dùng một cách mạch lạc, tự 
 {question}
 
 [YÊU CẦU]:
-- Trả lời bằng tiếng Việt, rõ ràng, gãy gọn, có cấu trúc.
-- Sử dụng trực tiếp thông tin trong ngữ cảnh.
-- Không bịa đặt thông tin nằm ngoài ngữ cảnh được cung cấp.
+- Trả lời bằng tiếng Việt, rõ ràng, gãy gọn, khách quan, có cấu trúc.
+- Ưu tiên sử dụng trực tiếp các dữ kiện có trong ngữ cảnh.
+- Nếu ngữ cảnh có chứa mốc thời gian chuyển giao quyền lực hoặc người đảm nhiệm chức vụ gần nhất (ví dụ: "Từ năm 2013, Tập Cận Bình kế nhiệm..."), hãy giải thích rõ ràng và khẳng định chức vụ đó.
+- Trường hợp ngữ cảnh chưa đề cập đầy đủ, bạn có thể bổ sung kiến thức bách khoa chính xác về thực thể đó để trả lời câu hỏi của người dùng một cách hữu ích nhất, đồng thời lưu ý nguồn gốc thông tin.
 """
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
