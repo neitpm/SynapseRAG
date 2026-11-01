@@ -238,23 +238,71 @@ export const App: React.FC = () => {
             {viewMode2D ? (
               <div className="flex-1 bg-slate-900/90 border border-slate-800 rounded-xl p-6 flex flex-col justify-between">
                 <div>
-                  <h3 className="text-sm font-semibold text-cyan-400 mb-4">Sơ đồ luồng 2D (Query Pipeline)</h3>
-                  <div className="flex items-center justify-between gap-2 p-4 bg-slate-950 rounded-lg border border-slate-800">
-                    <span className={`px-3 py-1.5 rounded font-mono text-xs ${activeNode === 'client' ? 'bg-cyan-500 text-black font-bold' : 'bg-slate-800 text-slate-400'}`}>1. Client UI</span>
-                    <span className="text-slate-600">➔</span>
-                    <span className={`px-3 py-1.5 rounded font-mono text-xs ${activeNode === 'gateway' ? 'bg-purple-500 text-black font-bold' : 'bg-slate-800 text-slate-400'}`}>2. Gateway (Embedding)</span>
-                    <span className="text-slate-600">➔</span>
-                    <span className={`px-3 py-1.5 rounded font-mono text-xs ${activeNode === 'neo4j' ? 'bg-cyan-400 text-black font-bold' : 'bg-slate-800 text-slate-400'}`}>3. Neo4j Graph & Vector</span>
-                    <span className="text-slate-600">➔</span>
-                    <span className={`px-3 py-1.5 rounded font-mono text-xs ${activeNode === 'gemini' ? 'bg-emerald-400 text-black font-bold' : 'bg-slate-800 text-slate-400'}`}>4. Gemini LLM</span>
-                    <span className="text-slate-600">➔</span>
-                    <span className={`px-3 py-1.5 rounded font-mono text-xs ${activeNode === 'result' ? 'bg-amber-400 text-black font-bold' : 'bg-slate-800 text-slate-400'}`}>5. Answer & Citations</span>
+                  <div className="flex items-center justify-between mb-4">
+                    <h3 className="text-sm font-bold text-cyan-400 uppercase tracking-wide">
+                      Sơ đồ luồng 2D: Luồng Hỏi Đáp (Query Pipeline)
+                    </h3>
+                    <span className="text-[11px] text-slate-400">5 bước xử lý tuần tự</span>
+                  </div>
+                  <div className="flex items-center justify-between gap-2 p-4 bg-slate-950 rounded-lg border border-slate-800 overflow-x-auto">
+                    <div className="flex flex-col items-center text-center">
+                      <span className={`px-3 py-1.5 rounded font-mono text-xs ${activeNode === 'client' ? 'bg-cyan-500 text-black font-bold shadow-lg shadow-cyan-500/50' : 'bg-slate-800 text-slate-300'}`}>
+                        1. Client UI
+                      </span>
+                      <span className="text-[10px] text-slate-400 mt-1">Giao diện người dùng</span>
+                    </div>
+
+                    <span className="text-slate-600 font-bold">➔</span>
+
+                    <div className="flex flex-col items-center text-center">
+                      <span className={`px-3 py-1.5 rounded font-mono text-xs ${activeNode === 'gateway' ? 'bg-purple-500 text-black font-bold shadow-lg shadow-purple-500/50' : 'bg-slate-800 text-slate-300'}`}>
+                        2. Gateway + Embedding
+                      </span>
+                      <span className="text-[10px] text-purple-300 mt-1">Nhúng vector nội bộ</span>
+                    </div>
+
+                    <span className="text-slate-600 font-bold">➔</span>
+
+                    <div className="flex flex-col items-center text-center">
+                      <span className={`px-3 py-1.5 rounded font-mono text-xs ${activeNode === 'neo4j' ? 'bg-cyan-400 text-black font-bold shadow-lg shadow-cyan-400/50' : 'bg-slate-800 text-slate-300'}`}>
+                        3. Neo4j 5.20
+                      </span>
+                      <span className="text-[10px] text-cyan-300 mt-1">Vector Index & Đồ thị</span>
+                    </div>
+
+                    <span className="text-slate-600 font-bold">➔</span>
+
+                    <div className="flex flex-col items-center text-center">
+                      <span className={`px-3 py-1.5 rounded font-mono text-xs ${activeNode === 'gemini' ? 'bg-emerald-400 text-black font-bold shadow-lg shadow-emerald-400/50' : 'bg-slate-800 text-slate-300'}`}>
+                        4. Google Gemini
+                      </span>
+                      <span className="text-[10px] text-emerald-300 mt-1">LLM tổng hợp văn bản</span>
+                    </div>
+
+                    <span className="text-slate-600 font-bold">➔</span>
+
+                    <div className="flex flex-col items-center text-center">
+                      <span className={`px-3 py-1.5 rounded font-mono text-xs ${activeNode === 'result' ? 'bg-amber-400 text-black font-bold shadow-lg shadow-amber-400/50' : 'bg-slate-800 text-slate-300'}`}>
+                        5. Answer & Citations
+                      </span>
+                      <span className="text-[10px] text-amber-300 mt-1">Trả lời & nguồn bài</span>
+                    </div>
                   </div>
                 </div>
 
-                <div className="p-4 bg-slate-950/80 rounded-lg border border-slate-800/80 text-xs text-slate-400 mt-6">
-                  <span className="text-rose-400 font-bold block mb-1">Luồng nạp dữ liệu nền độc lập (Background Ingestion):</span>
-                  Wikipedia Producer ➔ Kafka topic <code className="text-slate-300">wiki-raw-articles</code> ➔ Cassandra (Raw Lake) & AI Ingestion Worker ➔ Neo4j Store.
+                <div className="p-4 bg-slate-950/80 rounded-lg border border-rose-900/40 text-xs text-slate-300 mt-6">
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full bg-rose-500"></span>
+                    <span className="text-rose-400 font-bold uppercase tracking-wide">
+                      Luồng nạp dữ liệu nền độc lập (Background Ingestion):
+                    </span>
+                  </div>
+                  <p className="text-slate-400 text-[11px] leading-relaxed">
+                    Wiki Producer ➔ Kafka topic <code className="text-slate-300 font-mono">wiki-raw-articles</code> ➔ Cassandra (Raw Lake) & AI Ingestion Worker ➔ Neo4j Store.
+                    <span className="block text-amber-400 mt-1 font-medium">
+                      * Chú ý: Luồng nạp dữ liệu nền không chạy lại khi người dùng hỏi câu hỏi.
+                    </span>
+                  </p>
                 </div>
               </div>
             ) : (
