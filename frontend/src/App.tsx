@@ -27,8 +27,8 @@ export const App: React.FC = () => {
 
   const initialSteps: TimelineStep[] = [
     { stepId: 1, name: '1. Question Embedding', status: 'pending', details: 'Sinh vector 384 chiều bên trong GraphQL Gateway.' },
-    { stepId: 2, name: '2. Vector Search & Graph Traversal', status: 'pending', details: 'Truy vấn Neo4j Index Vector & mở rộng quan hệ đồ thị.' },
-    { stepId: 3, name: '3. Answer Generation (LLM)', status: 'pending', details: 'Google Gemini (gemini-2.5-flash-lite) tổng hợp câu trả lời tự nhiên.' },
+    { stepId: 2, name: '2. Hybrid Search (Vector + BM25) & Graph', status: 'pending', details: 'Truy vấn kết hợp Vector Cosine + BM25 Okapi & mở rộng đồ thị Neo4j.' },
+    { stepId: 3, name: '3. Answer Generation (LLM)', status: 'pending', details: 'Google Gemini (gemini-3-flash-preview) tổng hợp câu trả lời tự nhiên.' },
   ];
 
   const [steps, setSteps] = useState<TimelineStep[]>(initialSteps);

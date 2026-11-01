@@ -13,6 +13,8 @@ from fastapi.responses import StreamingResponse
 from strawberry.fastapi import GraphQLRouter
 from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
+import re
 
 # Hỗ trợ UTF-8 cho Windows Terminal
 sys.stdout.reconfigure(encoding="utf-8")
@@ -35,6 +37,14 @@ neo4j_driver = GraphDatabase.driver(
     settings.NEO4J_URI,
     auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
 )
+
+# Đảm bảo Fulltext Lucene / BM25 index tồn tại trên Neo4j
+try:
+    with neo4j_driver.session() as init_s:
+        init_s.run("CREATE FULLTEXT INDEX chunk_fulltext_index IF NOT EXISTS FOR (c:Chunk) ON EACH [c.text]")
+        logger.info("✅ Neo4j BM25/Fulltext index 'chunk_fulltext_index' đã sẵn sàng.")
+except Exception as e:
+    logger.warning(f"Không thể khởi tạo fulltext index trên Neo4j: {e}")
 
 # ============================================================================
 # LLM Generation via Gemini API
@@ -227,19 +237,21 @@ def execute_rag_pipeline(
         return "Lỗi trong quá trình sinh vector nhúng cho câu hỏi.", [], steps, total_ms
 
     # ----------------------------------------------------
-    # BƯỚC 2: Neo4j Vector Search & Graph Traversal
+    # BƯỚC 2: Neo4j Hybrid Search (Vector Cosine + BM25 Lexical + Graph Traversal)
     # ----------------------------------------------------
     notify("step_start", {
         "step_id": 2,
-        "name": "2. Vector Search & Graph Traversal",
+        "name": "2. Hybrid Search (Vector + BM25) & Graph",
         "active_node": "neo4j",
         "active_edge": "gateway_to_neo4j",
-        "details": "Truy vấn Neo4j Index Vector và mở rộng đồ thị qua quan hệ HAS_CHUNK, IN_CATEGORY, MENTIONS..."
+        "details": "Tìm kiếm kết hợp Hybrid Search: Vector Cosine + BM25 Okapi & mở rộng quan hệ đồ thị..."
     })
 
     step2_start = time.perf_counter()
-    cypher = """
-        CALL db.index.vector.queryNodes('chunk_vector_index', $top_k, $q_vec)
+    
+    # 1. Truy vấn Vector Index (Lấy top_k * 2 ứng viên)
+    vector_cypher = """
+        CALL db.index.vector.queryNodes('chunk_vector_index', $fetch_k, $q_vec)
         YIELD node, score
         MATCH (a:Article)-[:HAS_CHUNK]->(node)
         OPTIONAL MATCH (a)-[:IN_CATEGORY]->(cat:Category)
@@ -247,13 +259,102 @@ def execute_rag_pipeline(
         RETURN 
             node.chunk_id AS chunk_id,
             node.text AS text,
-            score,
+            score AS vector_score,
             a.title AS article_title,
             a.url AS article_url,
             collect(DISTINCT cat.name) AS categories,
             collect(DISTINCT m.title) AS mentions
-        ORDER BY score DESC
+        ORDER BY vector_score DESC
     """
+
+    # 2. Truy vấn BM25 Fulltext Index
+    fulltext_cypher = """
+        CALL db.index.fulltext.queryNodes('chunk_fulltext_index', $ft_query)
+        YIELD node, score
+        MATCH (a:Article)-[:HAS_CHUNK]->(node)
+        OPTIONAL MATCH (a)-[:IN_CATEGORY]->(cat:Category)
+        OPTIONAL MATCH (node)-[:MENTIONS]->(m:Article)
+        RETURN 
+            node.chunk_id AS chunk_id,
+            node.text AS text,
+            score AS bm25_score,
+            a.title AS article_title,
+            a.url AS article_url,
+            collect(DISTINCT cat.name) AS categories,
+            collect(DISTINCT m.title) AS mentions
+        LIMIT $fetch_k
+    """
+
+    def tokenize_text(t: str) -> list[str]:
+        return re.findall(r'\w+', t.lower())
+
+    def run_hybrid_retrieval(session, query_text: str, q_embedding: list[float], target_k: int):
+        fetch_k = max(target_k * 3, 15)
+        # Vector results
+        v_res = session.run(vector_cypher, {"q_vec": q_embedding, "fetch_k": fetch_k}).data()
+        
+        # BM25 / Fulltext query construction (Lấy các từ khóa quan trọng)
+        query_words = tokenize_text(query_text)
+        ft_query_str = " OR ".join([w for w in query_words if len(w) > 1]) if query_words else query_text
+        ft_res = []
+        try:
+            ft_res = session.run(fulltext_cypher, {"ft_query": ft_query_str, "fetch_k": fetch_k}).data()
+        except Exception as fte:
+            logger.warning(f"Lỗi truy vấn fulltext index (sẽ dùng BM25Okapi python): {fte}")
+
+        # Hợp nhất các ứng viên từ cả Vector Search và Fulltext
+        candidate_pool: dict[str, dict] = {}
+        for r in v_res:
+            cid = r["chunk_id"]
+            candidate_pool[cid] = {
+                "chunk_id": cid,
+                "text": r["text"],
+                "article_title": r["article_title"],
+                "article_url": r["article_url"],
+                "categories": r["categories"],
+                "mentions": r["mentions"],
+                "vector_score": float(r["vector_score"]),
+                "bm25_score": 0.0
+            }
+
+        for r in ft_res:
+            cid = r["chunk_id"]
+            if cid in candidate_pool:
+                candidate_pool[cid]["bm25_score"] = float(r["bm25_score"])
+            else:
+                candidate_pool[cid] = {
+                    "chunk_id": cid,
+                    "text": r["text"],
+                    "article_title": r["article_title"],
+                    "article_url": r["article_url"],
+                    "categories": r["categories"],
+                    "mentions": r["mentions"],
+                    "vector_score": 0.5, # Điểm mặc định cho từ khóa khớp nhưng vector chưa chạm
+                    "bm25_score": float(r["bm25_score"])
+                }
+
+        # Nếu tập ứng viên có sẵn, tính thêm BM25Okapi chính xác trên token tiếng Việt
+        cand_list = list(candidate_pool.values())
+        if cand_list:
+            tokenized_corpus = [tokenize_text(c["text"]) for c in cand_list]
+            bm25_calc = BM25Okapi(tokenized_corpus)
+            python_bm25_scores = bm25_calc.get_scores(tokenize_text(query_text))
+            
+            # Chuẩn hóa min-max điểm BM25 về [0, 1]
+            max_bm25 = max(python_bm25_scores) if len(python_bm25_scores) > 0 else 1.0
+            min_bm25 = min(python_bm25_scores) if len(python_bm25_scores) > 0 else 0.0
+            range_bm25 = (max_bm25 - min_bm25) if (max_bm25 - min_bm25) > 1e-6 else 1.0
+
+            for i, c in enumerate(cand_list):
+                norm_bm25 = (python_bm25_scores[i] - min_bm25) / range_bm25
+                v_score = c["vector_score"]
+                # Điểm kết hợp Hybrid: 60% Vector Semantic + 40% BM25 Keyword
+                c["hybrid_score"] = round(0.6 * v_score + 0.4 * norm_bm25, 4)
+                c["bm25_raw"] = round(float(python_bm25_scores[i]), 2)
+
+            cand_list.sort(key=lambda x: x["hybrid_score"], reverse=True)
+
+        return cand_list[:target_k]
 
     all_categories = set()
     all_mentions = set()
@@ -261,8 +362,8 @@ def execute_rag_pipeline(
 
     try:
         with neo4j_driver.session() as session:
-            results = session.run(cypher, {"q_vec": q_vec, "top_k": top_k}).data()
-            for r in results:
+            final_candidates = run_hybrid_retrieval(session, question, q_vec, top_k)
+            for r in final_candidates:
                 cats = [c for c in r["categories"] if c]
                 mentions = [m for m in r["mentions"] if m]
                 all_categories.update(cats)
@@ -273,18 +374,17 @@ def execute_rag_pipeline(
                     "chunk_id": r["chunk_id"],
                     "article_title": r["article_title"],
                     "article_url": r["article_url"],
-                    "score": round(r["score"], 4),
+                    "score": r["hybrid_score"],
                     "text": r["text"],
                     "related_categories": cats[:3],
                     "mentioned_articles": mentions
                 })
-                context_snippets.append(f"• [Nguồn: {r['article_title']} | Độ tương đồng: {r['score']:.2f}]\n{r['text'].strip()}")
+                context_snippets.append(f"• [Nguồn: {r['article_title']} | Điểm Hybrid (Vector+BM25): {r['hybrid_score']:.2f}]\n{r['text'].strip()}")
 
         step2_dur = round((time.perf_counter() - step2_start) * 1000, 2)
         top_score = sources[0]["score"] if sources else 0.0
 
         # ON-DEMAND DYNAMIC CRAWL:
-        # Kiểm tra xem từ khóa của câu hỏi có khớp với tiêu đề bài viết nào trong đồ thị hay không
         topic_candidate = extract_keyword_candidate(question)
         has_matched_article = False
         if topic_candidate:
@@ -306,16 +406,15 @@ def execute_rag_pipeline(
             
             crawled, crawled_title, chunk_cnt = fetch_and_store_wiki_on_demand(topic_candidate, neo4j_driver, embedder)
             if crawled:
-                logger.info(f"✨ Nạp thành công bài '{crawled_title}' ({chunk_cnt} chunks). Đang tái truy vấn đồ thị...")
-                # Truy vấn lại sau khi nạp bài mới
+                logger.info(f"✨ Nạp thành công bài '{crawled_title}' ({chunk_cnt} chunks). Đang tái truy vấn Hybrid đồ thị...")
                 sources.clear()
                 context_snippets.clear()
                 all_categories.clear()
                 all_mentions.clear()
                 all_articles.clear()
                 with neo4j_driver.session() as session:
-                    re_results = session.run(cypher, {"q_vec": q_vec, "top_k": top_k}).data()
-                    for r in re_results:
+                    re_candidates = run_hybrid_retrieval(session, question, q_vec, top_k)
+                    for r in re_candidates:
                         cats = [c for c in r["categories"] if c]
                         mentions = [m for m in r["mentions"] if m]
                         all_categories.update(cats)
@@ -326,12 +425,12 @@ def execute_rag_pipeline(
                             "chunk_id": r["chunk_id"],
                             "article_title": r["article_title"],
                             "article_url": r["article_url"],
-                            "score": round(r["score"], 4),
+                            "score": r["hybrid_score"],
                             "text": r["text"],
                             "related_categories": cats[:3],
                             "mentioned_articles": mentions
                         })
-                        context_snippets.append(f"• [Nguồn: {r['article_title']} | Độ tương đồng: {r['score']:.2f}]\n{r['text'].strip()}")
+                        context_snippets.append(f"• [Nguồn: {r['article_title']} | Điểm Hybrid (Vector+BM25): {r['hybrid_score']:.2f}]\n{r['text'].strip()}")
 
         step2_metrics = [
             StepMetric(key="top_k_requested", value=str(top_k)),
