@@ -74,7 +74,7 @@ Hãy trả lời câu hỏi của người dùng một cách mạch lạc, tự 
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 600
+            "maxOutputTokens": 1500
         }
     }
 

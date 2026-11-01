@@ -25,45 +25,25 @@ text_splitter = RecursiveCharacterTextSplitter(
 def extract_keyword_candidate(question: str) -> str:
     """
     Trích xuất từ khóa chủ đề tiềm năng từ câu hỏi tiếng Việt.
-    1. Thử dùng Gemini LLM để lấy đúng thực thể/chủ đề tìm kiếm bách khoa (rất thông minh và chuẩn xác).
-    2. Fallback sang Regex làm sạch câu hỏi nếu LLM bận hoặc lỗi.
+    Nếu hỏi về chức vụ ('ai là [chức vụ] [quốc gia]'): bổ sung cả dạng 'Danh sách [chức vụ] [quốc gia]'.
     """
-    if settings.GEMINI_API_KEY:
-        try:
-            prompt = (
-                "Nhiệm vụ: Trích xuất 1 tên thực thể hoặc từ khóa chủ đề danh từ ngắn gọn nhất (1-4 từ) "
-                "để tra cứu bài viết bách khoa toàn thư trên Wikipedia tiếng Việt cho câu hỏi dưới đây.\n"
-                "Chỉ trả về duy nhất từ khóa, không kèm lời giải thích, không dấu câu thừa.\n\n"
-                "Ví dụ:\n"
-                "- 'ai đang là chủ tịch nước Trung Quốc?' -> Chủ tịch nước Trung Quốc\n"
-                "- 'Thủ đô của nước Pháp là gì?' -> Paris\n"
-                "- 'Tình yêu là gì?' -> Tình yêu\n"
-                "- 'Cho tôi biết về Trí tuệ nhân tạo' -> Trí tuệ nhân tạo\n\n"
-                f"Câu hỏi: {question}\n"
-                "Từ khóa:"
-            )
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{settings.GEMINI_MODEL}:generateContent?key={settings.GEMINI_API_KEY}"
-            payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
-            req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=5) as r:
-                data = json.loads(r.read().decode("utf-8"))
-                topic = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-                topic = re.sub(r'[\"\'`]', '', topic).strip()
-                if topic and len(topic) >= 2:
-                    logger.info(f"🧠 [LLM Extracted Topic]: '{topic}' từ câu hỏi '{question}'")
-                    return topic
-        except Exception as e:
-            logger.warning(f"Lỗi khi trích xuất từ khóa bằng LLM: {e}. Chuyển sang fallback regex.")
-
-    # Fallback: Quy tắc lọc từ ngữ tiếng Việt
     cleaned = re.sub(
         r'(?i)\b(cho tôi biết|bạn có biết|hãy giải thích|giải thích|tìm hiểu về|nói về|định nghĩa|ai đang là|ai là|ai|là ai|là gì|ở đâu|như thế nào|tại sao|ứng dụng ra sao|về|của|có những gì|ra sao|thế nào)\b', 
         ' ', 
         question
     )
     cleaned = re.sub(r'[?.,!\"\'\(\)]', ' ', cleaned)
-    cleaned = " ".join(cleaned.split()).strip()
-    return cleaned
+    topic = " ".join(cleaned.split()).strip()
+
+    is_who = bool(re.search(r'(?i)\b(ai là|ai đang là|là ai|ai)\b', question))
+    if is_who and topic and not topic.lower().startswith("danh sách"):
+        # Với câu hỏi hỏi người đảm nhiệm chức vụ, ưu tiên tìm bài Danh sách
+        search_target = f"Danh sách {topic}"
+        best_title = search_wikipedia_title(search_target)
+        if best_title:
+            return best_title
+
+    return topic
 
 def search_wikipedia_title(query: str) -> str | None:
     """
