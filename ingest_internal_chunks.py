@@ -32,7 +32,8 @@ HEARTBEAT_INTERVAL_SECONDS = 30  # gửi heartbeat mỗi 30s
 
 class IngestionLockManager:
     """
-    Quản lý khóa phân tán Ingestion Lock với job_id, atomic conditional update và heartbeat.
+    Quản lý khóa phân tán Ingestion Lock với job_id, lease timeout recovery,
+    atomic conditional update và heartbeat.
     """
     def __init__(self, driver, job_id: str, staging_version: str):
         self.driver = driver
@@ -43,43 +44,71 @@ class IngestionLockManager:
 
     def acquire_lock(self) -> bool:
         """
-        Thực hiện Cypher Atomic Conditional Update:
-        Chỉ acquire được nếu:
-        - Chưa có node SystemConfig, HOẶC
-        - lock_job_id IS NULL, HOẶC
-        - lock_job_id = $job_id (re-entrant), HOẶC
-        - ingestion_status IN ['IDLE', 'FAILED']
-        LƯU Ý QUAN TRỌNG: Nếu job khác đang giữ lock và chưa release, DÙ quá 30 phút cũng KHÔNG
-        tự ý ghi đè lock hoặc xóa dữ liệu của nó (tuân thủ nguyên tắc an toàn).
+        Thực hiện Cypher Atomic Conditional Update với khả năng Crash Recovery:
+        Chỉ acquire được khi:
+        1. Chưa có lock: lock_job_id IS NULL (và status IDLE/FAILED)
+        2. Re-entrant: lock_job_id = $job_id
+        3. Crash Recovery (Lease Expired): lock_job_id IS NOT NULL nhưng last_heartbeat_at
+           đã quá hạn > LEASE_DURATION_SECONDS (do tiến trình trước bị crash cứng / kill -9).
+           Khi takeover lease quá hạn, atomic xóa các chunk staging mồ côi của job cũ.
         """
         now_ts = int(time.time())
+        lease_timeout_ts = now_ts - LEASE_DURATION_SECONDS
+
         acquire_cypher = """
         MERGE (s:SystemConfig {id: 'internal_rag_state'})
         WITH s
-        WHERE s.lock_job_id IS NULL 
-           OR s.lock_job_id = $job_id
-           OR coalesce(s.ingestion_status, 'IDLE') IN ['IDLE', 'FAILED']
+        WHERE (s.lock_job_id IS NULL AND coalesce(s.ingestion_status, 'IDLE') IN ['IDLE', 'FAILED'])
+           OR (s.lock_job_id = $job_id)
+           OR (s.lock_job_id IS NOT NULL AND coalesce(s.last_heartbeat_at, 0) < $lease_timeout_ts)
+        
+        // Lưu lại thông tin job mồ côi nếu có recovery
+        WITH s, 
+             s.lock_job_id AS old_job_id,
+             s.staging_version AS old_staging_ver,
+             CASE WHEN s.lock_job_id IS NOT NULL AND s.lock_job_id <> $job_id THEN true ELSE false END AS is_recovery
+
         SET s.lock_job_id = $job_id,
             s.staging_version = $staging_version,
             s.ingestion_status = 'INGESTING',
             s.lock_acquired_at = $now_ts,
             s.last_heartbeat_at = $now_ts
-        RETURN s.lock_job_id AS lock_job_id, s.staging_version AS staging_version
+        RETURN s.lock_job_id AS lock_job_id, 
+               s.staging_version AS staging_version,
+               is_recovery,
+               old_staging_ver
         """
         with self.driver.session() as session:
-            rec = session.run(acquire_cypher, job_id=self.job_id, staging_version=self.staging_version, now_ts=now_ts).single()
+            rec = session.run(
+                acquire_cypher,
+                job_id=self.job_id,
+                staging_version=self.staging_version,
+                now_ts=now_ts,
+                lease_timeout_ts=lease_timeout_ts
+            ).single()
+
             if rec and rec["lock_job_id"] == self.job_id:
+                if rec["is_recovery"]:
+                    old_ver = rec["old_staging_ver"]
+                    logger.warning(
+                        f"⚠️ CRASH RECOVERY: Phát hiện job trước bị treo/crash quá hạn lease "
+                        f"(> {LEASE_DURATION_SECONDS}s). Đã tiếp quản lock an toàn [job_id: {self.job_id}]."
+                    )
+                    if old_ver:
+                        logger.info(f"🧹 Đang xóa các chunk staging mồ côi của job cũ ({old_ver})...")
+                        session.run("MATCH (c:InternalChunk {version: $ver}) DETACH DELETE c", ver=old_ver)
+                        logger.info(f"✅ Đã dọn dẹp xong staging mồ côi ({old_ver}).")
+
                 logger.info(f"🔒 Đã chiếm Ingestion Lock thành công [job_id: {self.job_id}, staging_version: {self.staging_version}]")
                 self._start_heartbeat()
                 return True
             else:
-                # Kiểm tra job đang chiếm giữ lock để log chi tiết
                 cur = session.run("MATCH (s:SystemConfig {id: 'internal_rag_state'}) RETURN s").single()
                 cur_data = dict(cur["s"]) if cur else {}
                 logger.error(
-                    f"⛔ KHÔNG THỂ CHIẾM LOCK: Hệ thống đang bị chiếm bởi job khác "
+                    f"⛔ KHÔNG THỂ CHIẾM LOCK: Hệ thống đang bị chiếm bởi job khác còn hiệu lực lease "
                     f"[job_id: {cur_data.get('lock_job_id')}, status: {cur_data.get('ingestion_status')}, "
-                    f"acquired_at: {cur_data.get('lock_acquired_at')}]. Từ chối chạy để tránh xung đột."
+                    f"last_heartbeat: {cur_data.get('last_heartbeat_at')}]. Từ chối chạy để tránh xung đột."
                 )
                 return False
 
@@ -109,7 +138,7 @@ class IngestionLockManager:
     def release_lock_on_failure(self):
         """
         Khi job thất bại, chỉ giải phóng nếu chính job_id này đang nắm lock.
-        Đổi trạng thái sang FAILED và dọn dẹp các chunk staging thuộc staging_version của job này.
+        Đổi trạng thái sang FAILED và dọn dẹp các chunk staging gắn với job_id này.
         """
         self.stop_heartbeat()
         release_cypher = """
@@ -127,9 +156,13 @@ class IngestionLockManager:
             res = session.run(release_cypher, job_id=self.job_id, staging_version=self.staging_version).single()
             if res:
                 logger.info(f"🔓 Đã chuyển trạng thái FAILED và giải phóng lock [job_id: {self.job_id}]")
-                # Xóa sạch toàn bộ staging chunks của job bị fail để tránh làm bẩn vector index
-                logger.info(f"🧹 Đang xóa các chunk staging của phiên bản lỗi ({self.staging_version})...")
-                session.run("MATCH (c:InternalChunk {version: $ver}) DETACH DELETE c", ver=self.staging_version)
+                # Xóa sạch toàn bộ staging chunks gắn với ingestion_job_id của job này
+                logger.info(f"🧹 Đang xóa các chunk staging của job lỗi [job_id: {self.job_id}, version: {self.staging_version}]...")
+                session.run("""
+                    MATCH (c:InternalChunk)
+                    WHERE c.ingestion_job_id = $job_id OR (c.version = $ver AND c.ingestion_job_id IS NULL)
+                    DETACH DELETE c
+                """, job_id=self.job_id, ver=self.staging_version)
                 logger.info(f"✅ Đã dọn dẹp xong staging lỗi ({self.staging_version}).")
 
 def read_sanitized_csv(file_name: str):
@@ -229,7 +262,7 @@ def init_internal_indexes(session):
             break
         time.sleep(1)
 
-def extract_chunks_from_field_logs(rows, tokenizer, version_tag: str):
+def extract_chunks_from_field_logs(rows, tokenizer, version_tag: str, job_id: str):
     chunks = []
     for r in rows:
         fid = r.get("id") or ""
@@ -259,11 +292,12 @@ def extract_chunks_from_field_logs(rows, tokenizer, version_tag: str):
                 "date": date,
                 "created_by": created_by,
                 "text": t,
-                "version": version_tag
+                "version": version_tag,
+                "ingestion_job_id": job_id
             })
     return chunks
 
-def extract_chunks_from_tasks(rows, tokenizer, version_tag: str):
+def extract_chunks_from_tasks(rows, tokenizer, version_tag: str, job_id: str):
     chunks = []
     for r in rows:
         tid = r.get("id") or ""
@@ -288,11 +322,12 @@ def extract_chunks_from_tasks(rows, tokenizer, version_tag: str):
                 "date": date[:10] if date else "",
                 "created_by": "",
                 "text": t,
-                "version": version_tag
+                "version": version_tag,
+                "ingestion_job_id": job_id
             })
     return chunks
 
-def extract_chunks_from_material_plans(rows, tokenizer, version_tag: str):
+def extract_chunks_from_material_plans(rows, tokenizer, version_tag: str, job_id: str):
     chunks = []
     for r in rows:
         mid = r.get("id") or ""
@@ -326,7 +361,8 @@ def extract_chunks_from_material_plans(rows, tokenizer, version_tag: str):
                 "date": date[:10] if date else "",
                 "created_by": "",
                 "text": t,
-                "version": version_tag
+                "version": version_tag,
+                "ingestion_job_id": job_id
             })
     return chunks
 
@@ -337,7 +373,8 @@ def chunk_list(lst, size=200):
 def perform_pre_swap_smoke_tests(session, staging_version: str, sample_chunk: dict) -> bool:
     """
     Smoke test retrieval thực tế trên Vector Index và Fulltext Index bằng dữ liệu đã biết của staging.
-    Overfetch 50 và kiểm tra xem chunk mẫu có nằm trong kết quả query không.
+    Xác nhận chính xác sample_id của chunk mẫu xuất hiện trong kết quả top-k để khẳng định HNSW index
+    đã index xong chunk vừa nạp.
     """
     logger.info("🧪 Đang thực hiện Pre-swap Smoke Test Retrieval trên chính phiên bản staging...")
     
@@ -345,20 +382,23 @@ def perform_pre_swap_smoke_tests(session, staging_version: str, sample_chunk: di
     sample_embedding = sample_chunk["embedding"]
     sample_id = sample_chunk["chunk_id"]
 
-    # 1. Smoke test Vector Index
+    # 1. Smoke test Vector Index - Phải tìm thấy chính xác sample_id trong top candidates
     vector_test_cypher = """
     CALL db.index.vector.queryNodes('internal_chunk_vector_index', 50, $sample_vec)
     YIELD node, score
     WHERE node.version = $version
     RETURN node.chunk_id AS chunk_id, score
-    LIMIT 10
+    LIMIT 20
     """
     try:
         v_results = session.run(vector_test_cypher, sample_vec=sample_embedding, version=staging_version).data()
-        if not v_results:
-            logger.error("❌ SMOKE TEST VECTOR FAILED: Vector index không trả về chunk nào thuộc staging version!")
+        retrieved_ids = [r["chunk_id"] for r in v_results]
+        if sample_id not in retrieved_ids:
+            logger.error(f"❌ SMOKE TEST VECTOR FAILED: sample_id '{sample_id}' không xuất hiện trong top kết quả vector ({retrieved_ids[:5]})!")
             return False
-        logger.info(f"   ✅ Vector Index Test PASSED: Truy xuất thành công {len(v_results)} chunk(s) (Top score: {v_results[0]['score']:.4f}).")
+        
+        sample_score = next(r["score"] for r in v_results if r["chunk_id"] == sample_id)
+        logger.info(f"   ✅ Vector Index Test PASSED: Đã định vị chính xác sample_id '{sample_id}' (Score: {sample_score:.4f}).")
     except Exception as e:
         logger.error(f"❌ SMOKE TEST VECTOR ERROR: {e}")
         return False
@@ -375,10 +415,11 @@ def perform_pre_swap_smoke_tests(session, staging_version: str, sample_chunk: di
     YIELD node, score
     WHERE node.version = $version
     RETURN node.chunk_id AS chunk_id, score
-    LIMIT 10
+    LIMIT 20
     """
     try:
         ft_results = session.run(ft_test_cypher, kw=search_keyword, version=staging_version).data()
+        ft_retrieved_ids = [r["chunk_id"] for r in ft_results]
         if not ft_results:
             logger.error(f"❌ SMOKE TEST FULLTEXT FAILED: Không tìm thấy kết quả cho từ khóa '{search_keyword}' trong staging version!")
             return False
@@ -433,12 +474,12 @@ def main():
         mat_plans_rows = read_sanitized_csv("material_plans.csv")
 
         chunks = []
-        chunks.extend(extract_chunks_from_field_logs(field_logs_rows, tokenizer, version_tag))
-        chunks.extend(extract_chunks_from_tasks(tasks_rows, tokenizer, version_tag))
-        chunks.extend(extract_chunks_from_material_plans(mat_plans_rows, tokenizer, version_tag))
+        chunks.extend(extract_chunks_from_field_logs(field_logs_rows, tokenizer, version_tag, job_id))
+        chunks.extend(extract_chunks_from_tasks(tasks_rows, tokenizer, version_tag, job_id))
+        chunks.extend(extract_chunks_from_material_plans(mat_plans_rows, tokenizer, version_tag, job_id))
 
         expected_count = len(chunks)
-        logger.info(f"📄 Đã trích xuất tổng cộng {expected_count} Internal Chunks cho phiên bản {version_tag}:")
+        logger.info(f"📄 Đã trích xuất tổng cộng {expected_count} Internal Chunks cho phiên bản {version_tag} [Job ID: {job_id}]:")
         logger.info(f"   - field_logs: {len([c for c in chunks if c['source_table'] == 'field_logs'])}")
         logger.info(f"   - tasks: {len([c for c in chunks if c['source_table'] == 'tasks'])}")
         logger.info(f"   - material_plans: {len([c for c in chunks if c['source_table'] == 'material_plans'])}")
@@ -461,7 +502,7 @@ def main():
         with driver.session() as session:
             init_internal_indexes(session)
 
-            logger.info(f"📥 Đang nạp {expected_count} chunks vào vùng Staging (version: {version_tag})...")
+            logger.info(f"📥 Đang nạp {expected_count} chunks vào vùng Staging (version: {version_tag}, job_id: {job_id})...")
             ingest_cypher = """
             UNWIND $batch AS row
             MERGE (c:InternalChunk {chunk_id: row.chunk_id})
@@ -472,7 +513,8 @@ def main():
                 c.created_by = row.created_by,
                 c.text = row.text,
                 c.embedding = row.embedding,
-                c.version = row.version
+                c.version = row.version,
+                c.ingestion_job_id = row.ingestion_job_id
             WITH c, row
             WHERE row.project_code IS NOT NULL AND row.project_code <> ''
             MATCH (p:Project {code: row.project_code})
@@ -482,13 +524,13 @@ def main():
             for batch in chunk_list(chunks, 200):
                 session.run(ingest_cypher, batch=batch)
 
-            # 6. XÁC MINH 1: Tính toàn vẹn số lượng chunks
+            # 6. XÁC MINH 1: Tính toàn vẹn số lượng chunks (kiểm tra theo cả version và ingestion_job_id)
             logger.info("🔍 Đang xác minh tính toàn vẹn số lượng chunk của phiên bản mới...")
             verify_query = """
-            MATCH (c:InternalChunk {version: $version})
+            MATCH (c:InternalChunk {version: $version, ingestion_job_id: $job_id})
             RETURN count(c) AS loaded_count
             """
-            loaded_count = session.run(verify_query, version=version_tag).single()["loaded_count"]
+            loaded_count = session.run(verify_query, version=version_tag, job_id=job_id).single()["loaded_count"]
             logger.info(f"   -> Kết quả: Đã nạp thành công {loaded_count}/{expected_count} chunks.")
 
             if loaded_count != expected_count:
@@ -543,8 +585,9 @@ def main():
     except Exception as e:
         logger.error(f"❌ LỖI TRONG QUÁ TRÌNH INGESTION: {e}")
         lock_mgr.release_lock_on_failure()
-        driver.close()
         sys.exit(1)
+    finally:
+        driver.close()
 
 if __name__ == "__main__":
     main()
