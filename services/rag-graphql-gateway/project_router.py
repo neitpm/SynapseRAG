@@ -202,7 +202,7 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
 
     # -------------------------------------------------------------------------
     # INTENT 4: Danh mục vật tư / Đơn hàng mua sắm
-    # Chỉ trả lời khi template đáp ứng chính xác câu hỏi; từ chối trả lời phỏng đoán
+    # Phân biệt rành mạch giữa 'Chưa đặt hàng' và thiếu dữ liệu (NULL / trống)
     # -------------------------------------------------------------------------
     if any(k in q_lower for k in ["vật tư chưa đặt", "chưa đặt hàng", "vật tư chưa có"]):
         proj_match = match_project_in_question(question, driver)
@@ -210,32 +210,34 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
             p_code, p_name = proj_match
             cypher = """
             MATCH (p:Project {code: $code})-[:HAS_PURCHASE_PLAN]->(pp:PurchasingPlan)
-            WHERE pp.order_status = 'Chưa đặt hàng' OR pp.order_status IS NULL
             RETURN p.name AS project_name,
-                   count(pp) AS pending_orders_count,
-                   collect(pp.content)[0..5] AS sample_items
+                   sum(CASE WHEN trim(coalesce(pp.order_status, '')) = 'Chưa đặt hàng' THEN 1 ELSE 0 END) AS pending_orders_count,
+                   sum(CASE WHEN trim(coalesce(pp.order_status, '')) = '' THEN 1 ELSE 0 END) AS unstated_status_count,
+                   collect(CASE WHEN trim(coalesce(pp.order_status, '')) = 'Chưa đặt hàng' THEN pp.content ELSE null END)[0..5] AS sample_pending_items
             """
             c_start = time.perf_counter()
             with driver.session() as session:
                 rec = session.run(cypher, code=p_code).single()
             c_dur = round((time.perf_counter() - c_start) * 1000, 2)
 
-            if rec and rec["pending_orders_count"] > 0:
-                sample_str = "\n".join([f"  - {it}" for it in rec["sample_items"] if it])
+            if rec:
+                pending_cnt = rec["pending_orders_count"] or 0
+                unstated_cnt = rec["unstated_status_count"] or 0
+                sample_pending = [it for it in (rec["sample_pending_items"] or []) if it]
+                
+                lines = [f"📦 **Vật tư thuộc dự án: {rec['project_name']} ({p_code})**\n"]
+                lines.append(f"- **Số hạng mục xác nhận 'Chưa đặt hàng':** {pending_cnt} mục")
+                if sample_pending:
+                    lines.append("- **Một số hạng mục chưa đặt tiêu biểu:**")
+                    for it in sample_pending:
+                        lines.append(f"  - {it}")
+                if unstated_cnt > 0:
+                    lines.append(f"\n*(Lưu ý: Có thêm {unstated_cnt} hạng mục chưa cập nhật trạng thái đặt hàng trong hệ thống)*")
+
                 return {
                     "intent": "PENDING_PURCHASE_ORDERS",
                     "cypher_duration_ms": c_dur,
-                    "formatted_answer": (
-                        f"📦 **Vật tư chưa đặt hàng thuộc dự án: {rec['project_name']} ({p_code})**\n\n"
-                        f"- **Tổng số hạng mục chưa đặt hàng:** {rec['pending_orders_count']} mục\n"
-                        f"- **Một số hạng mục tiêu biểu:**\n{sample_str}"
-                    )
-                }
-            else:
-                return {
-                    "intent": "PENDING_PURCHASE_ORDERS",
-                    "cypher_duration_ms": c_dur,
-                    "formatted_answer": f"📦 Dự án **{p_name} ({p_code})** hiện không có hạng mục nào ở trạng thái 'Chưa đặt hàng'."
+                    "formatted_answer": "\n".join(lines)
                 }
 
     if any(k in q_lower for k in ["tổng số vật tư", "kế hoạch vật tư", "danh mục vật tư"]):

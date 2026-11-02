@@ -190,15 +190,16 @@ def execute_rag_pipeline(
     # =========================================================================
     structured_res = execute_structured_query(question, neo4j_driver)
     if structured_res:
+        intent = structured_res.get("intent")
         router_dur = round((time.perf_counter() - t_start) * 1000, 2)
-        logger.info(f"🎯 Query Router: Khớp câu hỏi cấu trúc nội bộ [{structured_res.get('intent')}] ({router_dur}ms)")
+        logger.info(f"🎯 Query Router: Khớp câu hỏi cấu trúc nội bộ [{intent}] ({router_dur}ms)")
         
         notify("step_start", {
             "step_id": 1,
             "name": "1. Project Query Router",
             "active_node": "gateway",
             "active_edge": "client_to_gateway",
-            "details": f"Phát hiện câu hỏi thống kê nghiệp vụ dự án [{structured_res.get('intent')}]. Điều phối đến Structured Cypher Engine..."
+            "details": f"Phân loại câu hỏi nghiệp vụ dự án [{intent}]. Điều phối xử lý..."
         })
         notify("step_complete", {
             "step_id": 1,
@@ -206,29 +207,39 @@ def execute_rag_pipeline(
             "status": "SUCCESS",
             "duration_ms": router_dur,
             "active_node": "gateway",
-            "details": f"Đã định tuyến chính xác ý định: {structured_res.get('intent')}.",
-            "metrics": [{"key": "intent", "value": structured_res.get("intent")}]
+            "details": f"Đã định tuyến: {intent}.",
+            "metrics": [{"key": "intent", "value": intent}]
         })
-        cypher_real_dur = structured_res.get("cypher_duration_ms", 0.0)
-        notify("step_start", {
-            "step_id": 2,
-            "name": "2. Parameterized Cypher Analytics",
-            "active_node": "neo4j",
-            "active_edge": "gateway_to_neo4j",
-            "details": "Thực thi truy vấn Cypher định nghĩa sẵn có tham số để tổng hợp số liệu chính xác 100%..."
-        })
-        notify("step_complete", {
-            "step_id": 2,
-            "name": "2. Parameterized Cypher Analytics",
-            "status": "SUCCESS",
-            "duration_ms": cypher_real_dur,
-            "active_node": "neo4j",
-            "details": f"Truy vấn đồ thị quan hệ thành công ({cypher_real_dur}ms). Trích xuất số liệu hạch toán.",
-            "metrics": [
-                {"key": "query_type", "value": "Deterministic Cypher Aggregation"},
-                {"key": "measured_latency_ms", "value": str(cypher_real_dur)}
-            ]
-        })
+
+        # Phân biệt: Nếu là câu hỏi mơ hồ cần làm rõ -> KHÔNG báo giả đã chạy Cypher Analytics
+        if intent == "AMBIGUOUS_EXPENSE_QUERY":
+            notify("step_info", {
+                "step_id": 2,
+                "name": "2. Scope Clarification Required",
+                "active_node": "gateway",
+                "details": "Câu hỏi chi phí chưa xác định rõ phạm vi (dự án cụ thể hay toàn công ty). Đang yêu cầu người dùng làm rõ..."
+            })
+        else:
+            cypher_real_dur = structured_res.get("cypher_duration_ms", 0.0)
+            notify("step_start", {
+                "step_id": 2,
+                "name": "2. Parameterized Cypher Analytics",
+                "active_node": "neo4j",
+                "active_edge": "gateway_to_neo4j",
+                "details": "Thực thi truy vấn Cypher định nghĩa sẵn có tham số để tổng hợp số liệu chính xác 100%..."
+            })
+            notify("step_complete", {
+                "step_id": 2,
+                "name": "2. Parameterized Cypher Analytics",
+                "status": "SUCCESS",
+                "duration_ms": cypher_real_dur,
+                "active_node": "neo4j",
+                "details": f"Truy vấn đồ thị quan hệ thành công ({cypher_real_dur}ms). Trích xuất số liệu hạch toán.",
+                "metrics": [
+                    {"key": "query_type", "value": "Deterministic Cypher Aggregation"},
+                    {"key": "measured_latency_ms", "value": str(cypher_real_dur)}
+                ]
+            })
 
         formatted_answer = structured_res.get("formatted_answer", "")
         total_ms = round((time.perf_counter() - t_start) * 1000, 2)
@@ -238,7 +249,7 @@ def execute_rag_pipeline(
             "sources": [],
             "total_duration_ms": total_ms,
             "active_node": "result",
-            "active_edge": "neo4j_to_result"
+            "active_edge": "neo4j_to_result" if intent != "AMBIGUOUS_EXPENSE_QUERY" else "gateway_to_result"
         })
         return formatted_answer, [], steps, total_ms
 
@@ -453,63 +464,11 @@ def execute_rag_pipeline(
         step2_dur = round((time.perf_counter() - step2_start) * 1000, 2)
         top_score = sources[0]["score"] if sources else 0.0
 
-        # ON-DEMAND DYNAMIC CRAWL: (CHỈ áp dụng cho câu hỏi bách khoa bên ngoài, KHÔNG áp dụng cho câu hỏi dự án nội bộ)
-        topic_candidate = extract_keyword_candidate(question)
-        has_matched_article = False
-        if topic_candidate:
-            cand_lower = topic_candidate.lower()
-            for art in all_articles:
-                if cand_lower in art.lower() or art.lower() in cand_lower:
-                    has_matched_article = True
-                    break
-
-        # KIỂM SOÁT BẢO MẬT: Nhận diện động mọi dự án tồn tại trong Neo4j
-        # Tuyệt đối không gửi từ khóa / tên dự án ra ngoài Wikipedia dù router chưa có intent
-        matched_proj = match_project_in_question(question, neo4j_driver)
-        is_internal_project = (matched_proj is not None)
-        is_internal_keyword = any(k in question.lower() for k in [
-            "dự án", "trạm biến áp", "tba", "đường dây", "tiến độ", "vật tư", "chi phí", "kỹ sư", 
-            "công trường", "kho", "phụ trách", "tiền ăn", "tạm ứng"
-        ])
-        is_internal_query = is_internal_project or is_internal_keyword
-
-        # Nếu chưa có bài viết cho chủ đề này và không phải câu hỏi nội bộ
-        if (len(sources) == 0 or not has_matched_article) and not is_internal_query:
-            logger.info(f"🔍 Tri thức nội bộ chưa có bài viết trực tiếp cho '{topic_candidate}'. Thử tìm kiếm và nạp từ Wikipedia...")
-            notify("step_info", {
-                "step_id": 2,
-                "name": "Wikipedia On-Demand Crawl",
-                "active_node": "neo4j",
-                "details": f"Chưa có bài viết cho '{topic_candidate}' trong kho đồ thị. Đang tự động cào bài từ Wikipedia..."
-            })
-            
-            crawled, crawled_title, chunk_cnt = fetch_and_store_wiki_on_demand(topic_candidate, neo4j_driver, embedder)
-            if crawled:
-                logger.info(f"✨ Nạp thành công bài '{crawled_title}' ({chunk_cnt} chunks). Đang tái truy vấn Hybrid đồ thị...")
-                sources.clear()
-                context_snippets.clear()
-                all_categories.clear()
-                all_mentions.clear()
-                all_articles.clear()
-                with neo4j_driver.session() as session:
-                    re_candidates = run_hybrid_retrieval(session, question, q_vec, top_k)
-                    for r in re_candidates:
-                        cats = [c for c in r["categories"] if c]
-                        mentions = [m for m in r["mentions"] if m]
-                        all_categories.update(cats)
-                        all_mentions.update(mentions)
-                        all_articles.add(r["article_title"])
-
-                        sources.append({
-                            "chunk_id": r["chunk_id"],
-                            "article_title": r["article_title"],
-                            "article_url": r["article_url"],
-                            "score": r["hybrid_score"],
-                            "text": r["text"],
-                            "related_categories": cats[:3],
-                            "mentioned_articles": mentions
-                        })
-                        context_snippets.append(f"• [Nguồn: {r['article_title']} | Điểm Hybrid (Vector+BM25): {r['hybrid_score']:.2f}]\n{r['text'].strip()}")
+        # BẢO MẬT & CÁCH LY TUYỆT ĐỐI: 
+        # Trên nhánh internal-project-copilot, TẮT HOÀN TOÀN tính năng tự động cào Wikipedia ngầm (Auto On-demand Crawl).
+        # Tránh gửi bất kỳ thực thể, câu hỏi hay từ khóa chưa phân loại nào ra ngoài internet.
+        # Wikipedia chỉ được nạp có chủ đích qua pipeline offline hoặc admin console.
+        pass
 
         step2_metrics = [
             StepMetric(key="top_k_requested", value=str(top_k)),
