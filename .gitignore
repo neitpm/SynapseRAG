@@ -11,6 +11,8 @@ venv/
 # Environment files
 .env
 !.env.example
+.env.test
+!.env.test.example
 
 # Docker / Volume Data
 data/
