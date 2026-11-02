@@ -123,6 +123,11 @@ class SourceChunk:
     text: str
     related_categories: List[str]
     mentioned_articles: List[str]
+    # Trường Metadata trích dẫn chuyên biệt cho Dữ liệu Nội bộ (Extractive Lineage)
+    source_table: Optional[str] = None
+    source_id: Optional[str] = None
+    project_code: Optional[str] = None
+    date: Optional[str] = None
 
 @strawberry.type
 class RAGAnswer:
@@ -835,7 +840,11 @@ def run_internal_extractive_pipeline(
                 "score": c["hybrid_score"],
                 "text": c["text"],
                 "related_categories": [src_table, pcode],
-                "mentioned_articles": []
+                "mentioned_articles": [],
+                "source_table": src_table,
+                "source_id": src_id,
+                "project_code": pcode,
+                "date": c.get("date")
             })
 
         lines.append("*(Ghi chú an toàn: Toàn bộ nội dung trên được trích xuất nguyên văn trực tiếp từ CSDL nội bộ. Không gửi dữ liệu sang LLM đám mây)*")
@@ -893,7 +902,11 @@ class Query:
                 score=s["score"],
                 text=s["text"],
                 related_categories=s["related_categories"],
-                mentioned_articles=s["mentioned_articles"]
+                mentioned_articles=s["mentioned_articles"],
+                source_table=s.get("source_table"),
+                source_id=s.get("source_id"),
+                project_code=s.get("project_code"),
+                date=s.get("date")
             ) for s in raw_sources
         ]
         return RAGAnswer(
@@ -935,7 +948,11 @@ class Query:
                 score=s["score"],
                 text=s["text"],
                 related_categories=s["related_categories"],
-                mentioned_articles=s["mentioned_articles"]
+                mentioned_articles=s["mentioned_articles"],
+                source_table=s.get("source_table"),
+                source_id=s.get("source_id"),
+                project_code=s.get("project_code"),
+                date=s.get("date")
             ) for s in raw_sources
         ]
         return DebugRAGAnswer(
