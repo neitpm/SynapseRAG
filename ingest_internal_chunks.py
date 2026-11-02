@@ -71,6 +71,7 @@ class IngestionLockManager:
              CASE WHEN s.lock_job_id IS NOT NULL AND s.lock_job_id <> $job_id THEN true ELSE false END AS is_recovery
 
         SET s.lock_generation = coalesce(s.lock_generation, 0) + 1,
+            s.total_lock_takeovers = coalesce(s.total_lock_takeovers, 0) + (CASE WHEN is_recovery THEN 1 ELSE 0 END),
             s.lock_job_id = $job_id,
             s.staging_version = $staging_version,
             s.ingestion_status = 'INGESTING',
@@ -179,6 +180,7 @@ class IngestionLockManager:
         MATCH (s:SystemConfig {id: 'internal_rag_state'})
         WHERE s.lock_job_id = $job_id AND s.lock_generation = $token
         SET s.ingestion_status = 'FAILED',
+            s.total_rollbacks = coalesce(s.total_rollbacks, 0) + 1,
             s.failed_version = $staging_version,
             s.staging_version = null,
             s.lock_job_id = null,
@@ -522,6 +524,7 @@ def cleanup_old_version_async(neo4j_uri: str, neo4j_auth: tuple, old_version: st
     t.start()
 
 def main():
+    t_job_start = time.perf_counter()
     job_id = f"job_{uuid.uuid4().hex[:8]}"
     version_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger.info("===============================================================")
@@ -565,9 +568,11 @@ def main():
             return
 
         # 4. Tính toán Vector Embedding cho phiên bản mới
+        t_embed_start = time.perf_counter()
         texts_to_embed = [c["text"] for c in chunks]
         logger.info(f"⚡ Đang tính toán Vector Embedding cho {len(texts_to_embed)} chunks...")
         embeddings = embedder.encode(texts_to_embed, batch_size=64, show_progress_bar=True).tolist()
+        embed_duration_sec = round(time.perf_counter() - t_embed_start, 2)
 
         for i, emb in enumerate(embeddings):
             chunks[i]["embedding"] = emb
@@ -644,12 +649,15 @@ def main():
                 raise RuntimeError("Mất quyền sở hữu Ingestion Lock trước Smoke Test!")
 
             sample_chunk = chunks[0]
+            t_smoke_start = time.perf_counter()
             smoke_ok = perform_pre_swap_smoke_tests(session, version_tag, sample_chunk)
+            smoke_duration_sec = round(time.perf_counter() - t_smoke_start, 2)
             if not smoke_ok:
                 raise RuntimeError("Pre-swap Smoke Test Retrieval thất bại! Indexes chưa sẵn sàng truy xuất.")
 
             # 8. ATOMIC SWAP ACTIVE POINTER TRONG TRANSACTION (Có ràng buộc Fencing Token)
             logger.info("🔄 Đang thực hiện Atomic Pointer Swap chuyển active_version...")
+            total_job_dur = round(time.perf_counter() - t_job_start, 2)
             swap_query = """
             MATCH (s:SystemConfig {id: 'internal_rag_state'})
             WHERE s.lock_job_id = $job_id AND s.lock_generation = $token
@@ -661,7 +669,11 @@ def main():
                 s.lock_acquired_at = null,
                 s.last_heartbeat_at = null,
                 s.updated_at = $updated_at,
-                s.total_chunks = $total_chunks
+                s.total_chunks = $total_chunks,
+                s.last_ingestion_job_id = $job_id,
+                s.last_ingestion_duration_sec = $total_dur,
+                s.last_embedding_duration_sec = $embed_dur,
+                s.last_smoke_duration_sec = $smoke_dur
             RETURN s.active_version AS active_version, s.previous_version AS previous_version
             """
             res = session.run(
@@ -670,7 +682,10 @@ def main():
                 token=lock_mgr.fencing_token,
                 version=version_tag, 
                 updated_at=datetime.now().isoformat(),
-                total_chunks=loaded_count
+                total_chunks=loaded_count,
+                total_dur=total_job_dur,
+                embed_dur=embed_duration_sec,
+                smoke_dur=smoke_duration_sec
             ).single()
 
             if not res:

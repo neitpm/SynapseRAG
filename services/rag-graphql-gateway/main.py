@@ -15,8 +15,10 @@ from neo4j import GraphDatabase
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 import re
+from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from fastapi.responses import Response
 
-# Hỗ trợ UTF-8 cho Windows Terminal
+# Reconfigure UTF-8 for Windows Terminal
 sys.stdout.reconfigure(encoding="utf-8")
 
 ROOT_DIR = Path(__file__).resolve().parent.parent.parent
@@ -29,6 +31,74 @@ from auth_rbac import verify_access_token, AuthUser, create_access_token
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rag-graphql-gateway")
+
+# ============================================================================
+# PROMETHEUS OBSERVABILITY METRICS
+# ============================================================================
+# 1. Đo lường xác thực (Auth results)
+AUTH_REQUESTS_TOTAL = Counter(
+    "rag_auth_requests_total",
+    "Tổng số request xác thực tài khoản",
+    ["status"]  # "success" | "missing_token" | "invalid_token" | "forbidden"
+)
+
+# 2. Đo lường request theo chế độ thực thi (Mode)
+RAG_REQUESTS_TOTAL = Counter(
+    "rag_requests_total",
+    "Tổng số truy vấn RAG theo chế độ",
+    ["mode"]  # "extractive_internal" | "structured_cypher" | "graph_external"
+)
+
+# 3. Đo lường thời gian thực thi Extractive RAG (Latency Histogram)
+RAG_EXTRACTIVE_DURATION_SECONDS = Histogram(
+    "rag_extractive_duration_seconds",
+    "Thời gian thực thi pipeline Extractive RAG (giây)",
+    buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+)
+
+# 4. Đo lường số lần retrieval rỗng (Recall Drop / Candidate-Pool Poisoning Alert)
+RAG_RETRIEVAL_EMPTY_TOTAL = Counter(
+    "rag_retrieval_empty_total",
+    "Số lần truy vấn Extractive RAG trả về 0 chunk kết quả",
+    ["target_project"]
+)
+
+# 5. Ingestion & System State Metrics (Scraped from SystemConfig)
+RAG_ACTIVE_VERSION_INFO = Gauge(
+    "rag_active_version_info",
+    "Phiên bản active_version hiện hành đang phục vụ truy vấn",
+    ["version"]
+)
+
+INGESTION_LOCK_TAKEOVERS_TOTAL = Gauge(
+    "rag_ingestion_lock_takeovers_total",
+    "Tổng số lần Ingestion Lock bị takeover do timeout/lease recovery"
+)
+
+INGESTION_ROLLBACKS_TOTAL = Gauge(
+    "rag_ingestion_rollbacks_total",
+    "Tổng số lần job nạp thất bại và thực hiện rollback staging"
+)
+
+INGESTION_LAST_DURATION_SECONDS = Gauge(
+    "rag_ingestion_last_duration_seconds",
+    "Thời gian chạy hoàn tất của job ingestion gần nhất (giây)"
+)
+
+INGESTION_LAST_EMBED_DURATION_SECONDS = Gauge(
+    "rag_ingestion_last_embed_duration_seconds",
+    "Thời gian tính toán embedding của job ingestion gần nhất (giây)"
+)
+
+INGESTION_LAST_SMOKE_DURATION_SECONDS = Gauge(
+    "rag_ingestion_last_smoke_duration_seconds",
+    "Thời gian chạy smoke test pre-swap của job ingestion gần nhất (giây)"
+)
+
+INGESTION_LAST_TOTAL_CHUNKS = Gauge(
+    "rag_ingestion_last_total_chunks",
+    "Tổng số chunks đã nạp thành công của phiên bản active_version hiện hành"
+)
 
 # Khởi tạo SentenceTransformer model (dùng chung all-MiniLM-L6-v2 384-dims)
 logger.info(f"Đang tải Embedding model '{settings.EMBEDDING_MODEL}'...")
@@ -256,6 +326,7 @@ def execute_rag_pipeline(
 
         formatted_answer = structured_res.get("formatted_answer", "")
         total_ms = round((time.perf_counter() - t_start) * 1000, 2)
+        RAG_REQUESTS_TOTAL.labels(mode="structured_cypher").inc()
         notify("pipeline_complete", {
             "question": question,
             "answer": formatted_answer,
@@ -598,6 +669,7 @@ def execute_rag_pipeline(
     })
 
     total_ms = round((time.perf_counter() - t_start) * 1000, 2)
+    RAG_REQUESTS_TOTAL.labels(mode="graph_external").inc()
     notify("pipeline_complete", {
         "question": question,
         "answer": answer,
@@ -666,6 +738,7 @@ def run_internal_extractive_pipeline(
             "duration_ms": 0.5,
             "error": f"Tài khoản {auth_user.user_id} không có quyền truy cập dự án {target_name} ({target_code})."
         })
+        AUTH_REQUESTS_TOTAL.labels(status="forbidden").inc()
         denied_msg = f"⛔ **Truy cập bị từ chối (403 Forbidden):** Tài khoản của bạn (`{auth_user.user_id}`) không được phân quyền xem nhật trình và ghi chú kỹ thuật của dự án **{target_name} ({target_code})**."
         total_ms = round((time.perf_counter() - t_start) * 1000, 2)
         notify("pipeline_complete", {
@@ -748,6 +821,8 @@ def run_internal_extractive_pipeline(
             # Lấy active_version hiện hành từ SystemConfig
             cfg_res = session.run("MATCH (s:SystemConfig {id: 'internal_rag_state'}) RETURN s.active_version AS active_version").single()
             active_version = cfg_res["active_version"] if cfg_res and cfg_res.get("active_version") else None
+            if active_version:
+                RAG_ACTIVE_VERSION_INFO.labels(version=active_version).set(1)
 
             # Cypher Vector Query có điều kiện RBAC & Active Version ngay tại DB
             vector_rbac_cypher = """
@@ -947,6 +1022,10 @@ def run_internal_extractive_pipeline(
     })
 
     total_ms = round((time.perf_counter() - t_start) * 1000, 2)
+    RAG_REQUESTS_TOTAL.labels(mode="extractive_internal").inc()
+    RAG_EXTRACTIVE_DURATION_SECONDS.observe((time.perf_counter() - t_start))
+    if len(final_chunks) == 0:
+        RAG_RETRIEVAL_EMPTY_TOTAL.labels(target_project=target_code or "all").inc()
     notify("pipeline_complete", {
         "question": question,
         "answer": answer_text,
@@ -1052,15 +1131,19 @@ class Query:
 async def get_context(request: Request) -> Dict[str, Any]:
     auth_header = request.headers.get("Authorization")
     if not auth_header:
+        AUTH_REQUESTS_TOTAL.labels(status="missing_token").inc()
         raise HTTPException(
             status_code=401,
             detail="401 Unauthorized: Yêu cầu Authorization Bearer token hợp lệ để truy vấn GraphQL."
         )
     try:
         auth_user = verify_access_token(auth_header)
+        AUTH_REQUESTS_TOTAL.labels(status="success").inc()
     except PermissionError as pe:
+        AUTH_REQUESTS_TOTAL.labels(status="forbidden").inc()
         raise HTTPException(status_code=401, detail=str(pe))
     except Exception as e:
+        AUTH_REQUESTS_TOTAL.labels(status="invalid_token").inc()
         raise HTTPException(status_code=401, detail=f"401 Unauthorized: Token không hợp lệ ({str(e)})")
 
     return {"request": request, "auth_user": auth_user}
@@ -1101,6 +1184,7 @@ async def stream_rag_debug(
     Bảo mật: Bắt buộc Authorization header hợp lệ. Trả 401 ngay lập tức nếu thiếu hoặc sai token.
     """
     if not authorization:
+        AUTH_REQUESTS_TOTAL.labels(status="missing_token").inc()
         raise HTTPException(
             status_code=401,
             detail="401 Unauthorized: Yêu cầu Authorization Bearer token hợp lệ để kết nối SSE stream."
@@ -1108,9 +1192,12 @@ async def stream_rag_debug(
 
     try:
         auth_user = verify_access_token(authorization)
+        AUTH_REQUESTS_TOTAL.labels(status="success").inc()
     except PermissionError as pe:
+        AUTH_REQUESTS_TOTAL.labels(status="forbidden").inc()
         raise HTTPException(status_code=401, detail=str(pe))
     except Exception as e:
+        AUTH_REQUESTS_TOTAL.labels(status="invalid_token").inc()
         raise HTTPException(status_code=401, detail=f"401 Unauthorized: Token không hợp lệ ({str(e)})")
 
     event_queue: asyncio.Queue = asyncio.Queue()
@@ -1142,6 +1229,38 @@ async def stream_rag_debug(
             yield f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.get("/metrics")
+def metrics_endpoint():
+    """
+    Prometheus Scrape Endpoint:
+    Đồng bộ thông số ingestion từ SystemConfig Neo4j trước khi xuất metrics.
+    """
+    try:
+        with neo4j_driver.session() as session:
+            cfg = session.run("""
+                MATCH (s:SystemConfig {id: 'internal_rag_state'})
+                RETURN s.active_version AS active_version,
+                       coalesce(s.total_lock_takeovers, 0) AS total_lock_takeovers,
+                       coalesce(s.total_rollbacks, 0) AS total_rollbacks,
+                       coalesce(s.last_ingestion_duration_sec, 0.0) AS last_ingestion_duration_sec,
+                       coalesce(s.last_embedding_duration_sec, 0.0) AS last_embedding_duration_sec,
+                       coalesce(s.last_smoke_duration_sec, 0.0) AS last_smoke_duration_sec,
+                       coalesce(s.total_chunks, 0) AS total_chunks
+            """).single()
+            if cfg:
+                if cfg.get("active_version"):
+                    RAG_ACTIVE_VERSION_INFO.labels(version=cfg["active_version"]).set(1)
+                INGESTION_LOCK_TAKEOVERS_TOTAL.set(cfg["total_lock_takeovers"])
+                INGESTION_ROLLBACKS_TOTAL.set(cfg["total_rollbacks"])
+                INGESTION_LAST_DURATION_SECONDS.set(cfg["last_ingestion_duration_sec"])
+                INGESTION_LAST_EMBED_DURATION_SECONDS.set(cfg["last_embedding_duration_sec"])
+                INGESTION_LAST_SMOKE_DURATION_SECONDS.set(cfg["last_smoke_duration_sec"])
+                INGESTION_LAST_TOTAL_CHUNKS.set(cfg["total_chunks"])
+    except Exception as e:
+        logger.warning(f"Không thể sync ingestion metrics từ Neo4j: {e}")
+
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 if __name__ == "__main__":
     import uvicorn
