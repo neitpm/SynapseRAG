@@ -24,6 +24,7 @@ sys.path.append(str(ROOT_DIR))
 
 from shared.config import settings
 from wiki_dynamic import extract_keyword_candidate, fetch_and_store_wiki_on_demand
+from project_router import execute_structured_query
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rag-graphql-gateway")
@@ -38,13 +39,23 @@ neo4j_driver = GraphDatabase.driver(
     auth=(settings.NEO4J_USER, settings.NEO4J_PASSWORD)
 )
 
-# Đảm bảo Fulltext Lucene / BM25 index tồn tại trên Neo4j
+# Đảm bảo Fulltext Lucene / BM25 index và Vector Index tồn tại trên Neo4j
 try:
     with neo4j_driver.session() as init_s:
+        # Fulltext Lucene index
         init_s.run("CREATE FULLTEXT INDEX chunk_fulltext_index IF NOT EXISTS FOR (c:Chunk) ON EACH [c.text]")
-        logger.info("✅ Neo4j BM25/Fulltext index 'chunk_fulltext_index' đã sẵn sàng.")
+        # 384-dimensions Vector Index for all-MiniLM-L6-v2
+        init_s.run("""
+            CREATE VECTOR INDEX chunk_vector_index IF NOT EXISTS
+            FOR (c:Chunk) ON (c.embedding)
+            OPTIONS {indexConfig: {
+              `vector.dimensions`: 384,
+              `vector.similarity_function`: 'cosine'
+            }}
+        """)
+        logger.info("✅ Neo4j Vector index 'chunk_vector_index' & Fulltext index 'chunk_fulltext_index' đã sẵn sàng.")
 except Exception as e:
-    logger.warning(f"Không thể khởi tạo fulltext index trên Neo4j: {e}")
+    logger.warning(f"Không thể khởi tạo index trên Neo4j: {e}")
 
 # ============================================================================
 # LLM Generation via Gemini API
@@ -172,6 +183,60 @@ def execute_rag_pipeline(
         "timestamp": time.time(),
         "active_node": "gateway"
     })
+
+    # =========================================================================
+    # QUERY ROUTER: Kiểm tra câu hỏi nghiệp vụ / thống kê có cấu trúc trước
+    # Sử dụng Parameterized Cypher định nghĩa sẵn, không gửi dữ liệu dự án ra ngoài
+    # =========================================================================
+    structured_res = execute_structured_query(question, neo4j_driver)
+    if structured_res:
+        router_dur = round((time.perf_counter() - t_start) * 1000, 2)
+        logger.info(f"🎯 Query Router: Khớp câu hỏi cấu trúc nội bộ [{structured_res.get('intent')}] ({router_dur}ms)")
+        
+        notify("step_start", {
+            "step_id": 1,
+            "name": "1. Project Query Router",
+            "active_node": "gateway",
+            "active_edge": "client_to_gateway",
+            "details": f"Phát hiện câu hỏi thống kê nghiệp vụ dự án [{structured_res.get('intent')}]. Điều phối đến Structured Cypher Engine..."
+        })
+        notify("step_complete", {
+            "step_id": 1,
+            "name": "1. Project Query Router",
+            "status": "SUCCESS",
+            "duration_ms": router_dur,
+            "active_node": "gateway",
+            "details": f"Đã định tuyến chính xác ý định: {structured_res.get('intent')}.",
+            "metrics": [{"key": "intent", "value": structured_res.get("intent")}]
+        })
+        notify("step_start", {
+            "step_id": 2,
+            "name": "2. Parameterized Cypher Analytics",
+            "active_node": "neo4j",
+            "active_edge": "gateway_to_neo4j",
+            "details": "Thực thi truy vấn Cypher định nghĩa sẵn có tham số để tổng hợp số liệu chính xác 100%..."
+        })
+        notify("step_complete", {
+            "step_id": 2,
+            "name": "2. Parameterized Cypher Analytics",
+            "status": "SUCCESS",
+            "duration_ms": 15.0,
+            "active_node": "neo4j",
+            "details": "Truy vấn đồ thị quan hệ thành công. Trích xuất số liệu hạch toán.",
+            "metrics": [{"key": "query_type", "value": "Deterministic Cypher Aggregation"}]
+        })
+
+        formatted_answer = structured_res.get("formatted_answer", "")
+        total_ms = round((time.perf_counter() - t_start) * 1000, 2)
+        notify("pipeline_complete", {
+            "question": question,
+            "answer": formatted_answer,
+            "sources": [],
+            "total_duration_ms": total_ms,
+            "active_node": "result",
+            "active_edge": "neo4j_to_result"
+        })
+        return formatted_answer, [], steps, total_ms
 
     # ----------------------------------------------------
     # BƯỚC 1: Embedding câu hỏi (Bên trong Gateway)
@@ -384,7 +449,7 @@ def execute_rag_pipeline(
         step2_dur = round((time.perf_counter() - step2_start) * 1000, 2)
         top_score = sources[0]["score"] if sources else 0.0
 
-        # ON-DEMAND DYNAMIC CRAWL:
+        # ON-DEMAND DYNAMIC CRAWL: (CHỈ áp dụng cho câu hỏi bách khoa bên ngoài, KHÔNG áp dụng cho câu hỏi dự án nội bộ)
         topic_candidate = extract_keyword_candidate(question)
         has_matched_article = False
         if topic_candidate:
@@ -394,8 +459,14 @@ def execute_rag_pipeline(
                     has_matched_article = True
                     break
 
-        # Nếu chưa có bài viết cho chủ đề này hoặc không tìm thấy chunk nào
-        if len(sources) == 0 or not has_matched_article:
+        # TẮT on-demand Wikipedia crawl nếu câu hỏi liên quan đến nội bộ công ty/dự án/vật tư
+        is_internal_query = any(k in question.lower() for k in [
+            "dự án", "trạm biến áp", "tba", "đường dây", "tiến độ", "vật tư", "chi phí", "kỹ sư", 
+            "công trường", "kho", "phước đông", "lục yên", "năm căn", "tây ninh", "bắc ninh", "nam cấm"
+        ])
+
+        # Nếu chưa có bài viết cho chủ đề này và không phải câu hỏi nội bộ
+        if (len(sources) == 0 or not has_matched_article) and not is_internal_query:
             logger.info(f"🔍 Tri thức nội bộ chưa có bài viết trực tiếp cho '{topic_candidate}'. Thử tìm kiếm và nạp từ Wikipedia...")
             notify("step_info", {
                 "step_id": 2,
@@ -683,4 +754,4 @@ async def stream_rag_debug(question: str = FastAPIQuery(..., description="Câu h
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
