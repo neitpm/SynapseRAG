@@ -1134,6 +1134,11 @@ class Query:
 # ============================================================================
 
 async def get_context(request: Request) -> Dict[str, Any]:
+    # Nếu là HTTP GET và accept html (trình duyệt tải GraphQL IDE UI) -> Cho phép tải UI
+    accept_header = request.headers.get("accept", "")
+    if request.method == "GET" and "text/html" in accept_header:
+        return {"request": request, "auth_user": None}
+
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         AUTH_REQUESTS_TOTAL.labels(status="missing_token").inc()
