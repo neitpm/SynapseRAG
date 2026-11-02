@@ -35,11 +35,13 @@ class IngestionLockManager:
     """
     Quản lý khóa phân tán Ingestion Lock với job_id, fencing_token (lock_generation),
     lease timeout recovery, atomic conditional update và heartbeat.
+    Hỗ trợ config_id linh hoạt để cách ly hoàn toàn môi trường Chaos Test (vd: 'chaos_test_rag_state').
     """
-    def __init__(self, driver, job_id: str, staging_version: str):
+    def __init__(self, driver, job_id: str, staging_version: str, config_id: str = "internal_rag_state"):
         self.driver = driver
         self.job_id = job_id
         self.staging_version = staging_version
+        self.config_id = config_id
         self.fencing_token = None
         self._stop_heartbeat = threading.Event()
         self._heartbeat_thread = None
@@ -59,7 +61,7 @@ class IngestionLockManager:
         lease_timeout_ts = now_ts - LEASE_DURATION_SECONDS
 
         acquire_cypher = """
-        MERGE (s:SystemConfig {id: 'internal_rag_state'})
+        MERGE (s:SystemConfig {id: $config_id})
         WITH s
         WHERE (s.lock_job_id IS NULL AND coalesce(s.ingestion_status, 'IDLE') IN ['IDLE', 'FAILED'])
            OR (s.lock_job_id = $job_id)
@@ -87,6 +89,7 @@ class IngestionLockManager:
         with self.driver.session() as session:
             rec = session.run(
                 acquire_cypher,
+                config_id=self.config_id,
                 job_id=self.job_id,
                 staging_version=self.staging_version,
                 now_ts=now_ts,
@@ -117,7 +120,7 @@ class IngestionLockManager:
                 self._start_heartbeat()
                 return True
             else:
-                cur = session.run("MATCH (s:SystemConfig {id: 'internal_rag_state'}) RETURN s").single()
+                cur = session.run("MATCH (s:SystemConfig {id: $config_id}) RETURN s", config_id=self.config_id).single()
                 cur_data = dict(cur["s"]) if cur else {}
                 logger.error(
                     f"⛔ KHÔNG THỂ CHIẾM LOCK: Hệ thống đang bị chiếm bởi job khác còn hiệu lực lease "
@@ -132,11 +135,11 @@ class IngestionLockManager:
         Nếu job bị treo quá lâu và bị job mới takeover (lock_generation đã tăng), check này sẽ trả về False ngay.
         """
         check_cypher = """
-        MATCH (s:SystemConfig {id: 'internal_rag_state'})
+        MATCH (s:SystemConfig {id: $config_id})
         RETURN s.lock_job_id AS lock_job_id, s.lock_generation AS lock_generation
         """
         with self.driver.session() as session:
-            rec = session.run(check_cypher).single()
+            rec = session.run(check_cypher, config_id=self.config_id).single()
             if not rec or rec["lock_job_id"] != self.job_id or rec["lock_generation"] != self.fencing_token:
                 logger.error(
                     f"🛑 FENCING TOKEN VIOLATION: Mất quyền sở hữu lock! "
@@ -152,13 +155,13 @@ class IngestionLockManager:
             while not self._stop_heartbeat.wait(HEARTBEAT_INTERVAL_SECONDS):
                 now_ts = int(time.time())
                 beat_cypher = """
-                MATCH (s:SystemConfig {id: 'internal_rag_state'})
+                MATCH (s:SystemConfig {id: $config_id})
                 WHERE s.lock_job_id = $job_id AND s.lock_generation = $token
                 SET s.last_heartbeat_at = $now_ts
                 """
                 try:
                     with self.driver.session() as session:
-                        session.run(beat_cypher, job_id=self.job_id, token=self.fencing_token, now_ts=now_ts)
+                        session.run(beat_cypher, config_id=self.config_id, job_id=self.job_id, token=self.fencing_token, now_ts=now_ts)
                 except Exception as e:
                     logger.warning(f"Lỗi khi gửi heartbeat ingestion lock: {e}")
 
@@ -177,7 +180,7 @@ class IngestionLockManager:
         """
         self.stop_heartbeat()
         release_cypher = """
-        MATCH (s:SystemConfig {id: 'internal_rag_state'})
+        MATCH (s:SystemConfig {id: $config_id})
         WHERE s.lock_job_id = $job_id AND s.lock_generation = $token
         SET s.ingestion_status = 'FAILED',
             s.total_rollbacks = coalesce(s.total_rollbacks, 0) + 1,
@@ -191,6 +194,7 @@ class IngestionLockManager:
         with self.driver.session() as session:
             res = session.run(
                 release_cypher,
+                config_id=self.config_id,
                 job_id=self.job_id,
                 token=self.fencing_token,
                 staging_version=self.staging_version
