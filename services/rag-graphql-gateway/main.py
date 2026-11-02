@@ -637,8 +637,21 @@ def run_internal_extractive_pipeline(
     target_name = target_project[1] if target_project else None
 
     # KIỂM TRA PHÂN QUYỀN TRƯỚC TRUY VẤN (Pre-retrieval RBAC Check)
+    if not auth_user:
+        denied_msg = "⛔ **Truy cập bị từ chối (401 Unauthorized):** Yêu cầu Authorization Bearer token hợp lệ để truy cập nhật trình và ghi chú dự án."
+        total_ms = round((time.perf_counter() - t_start) * 1000, 2)
+        notify("pipeline_complete", {
+            "question": question,
+            "answer": denied_msg,
+            "sources": [],
+            "total_duration_ms": total_ms,
+            "active_node": "result",
+            "active_edge": "gateway_to_result"
+        })
+        return denied_msg, [], steps, total_ms
+
     # Nếu câu hỏi nhắm vào 1 dự án cụ thể mà user không có quyền -> Chặn ngay lập tức
-    if target_code and auth_user and not auth_user.can_access_project(target_code):
+    if target_code and not auth_user.can_access_project(target_code):
         notify("step_start", {
             "step_id": 1,
             "name": "1. Security & RBAC Enforcement",
@@ -725,9 +738,9 @@ def run_internal_extractive_pipeline(
     # Overfetch lớn trên Neo4j 5.20 để bù đắp việc xếp hạng toàn cục trước khi Cypher lọc
     fetch_k = max(top_k * 15, 150)
 
-    # Chuẩn bị tham số quyền hạn cho Cypher
-    is_admin = auth_user.is_admin if auth_user else True
-    allowed_list = auth_user.allowed_projects if (auth_user and not is_admin) else []
+    # Chuẩn bị tham số quyền hạn cho Cypher (KHÔNG BAO GIỜ MẶC ĐỊNH LÀ ADMIN)
+    is_admin = auth_user.is_admin
+    allowed_list = auth_user.allowed_projects if not is_admin else []
 
     candidate_pool: dict[str, dict] = {}
     try:
@@ -1030,12 +1043,18 @@ class Query:
 
 async def get_context(request: Request) -> Dict[str, Any]:
     auth_header = request.headers.get("Authorization")
-    auth_user = None
-    if auth_header:
-        try:
-            auth_user = verify_access_token(auth_header)
-        except Exception as e:
-            logger.warning(f"GraphQL Token Invalid: {e}")
+    if not auth_header:
+        raise HTTPException(
+            status_code=401,
+            detail="401 Unauthorized: Yêu cầu Authorization Bearer token hợp lệ để truy vấn GraphQL."
+        )
+    try:
+        auth_user = verify_access_token(auth_header)
+    except PermissionError as pe:
+        raise HTTPException(status_code=401, detail=str(pe))
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"401 Unauthorized: Token không hợp lệ ({str(e)})")
+
     return {"request": request, "auth_user": auth_user}
 
 schema = strawberry.Schema(query=Query)
@@ -1067,18 +1086,24 @@ def health_check():
 async def stream_rag_debug(
     question: str = FastAPIQuery(..., description="Câu hỏi cần RAG"),
     top_k: int = 3,
-    authorization: Optional[str] = Header(None, description="Bearer Token xác thực RBAC")
+    authorization: Optional[str] = Header(None, description="Bearer Token xác thực RBAC bắt buộc")
 ):
     """
     SSE stream endpoint cho Developer UI, chạy cùng một hàm `execute_rag_pipeline` duy nhất.
-    Bảo mật: Xác thực token từ Authorization header và truyền auth_user xuống pipeline.
+    Bảo mật: Bắt buộc Authorization header hợp lệ. Trả 401 ngay lập tức nếu thiếu hoặc sai token.
     """
-    auth_user = None
-    if authorization:
-        try:
-            auth_user = verify_access_token(authorization)
-        except Exception as e:
-            logger.warning(f"SSE Auth Token Invalid: {e}")
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="401 Unauthorized: Yêu cầu Authorization Bearer token hợp lệ để kết nối SSE stream."
+        )
+
+    try:
+        auth_user = verify_access_token(authorization)
+    except PermissionError as pe:
+        raise HTTPException(status_code=401, detail=str(pe))
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"401 Unauthorized: Token không hợp lệ ({str(e)})")
 
     event_queue: asyncio.Queue = asyncio.Queue()
 

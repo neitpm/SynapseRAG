@@ -34,12 +34,19 @@ def match_project_in_question(question: str, driver: Driver) -> Optional[Tuple[s
                 return code, name
     return None
 
-def execute_structured_query(question: str, driver: Driver, auth_user: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> Optional[Dict[str, Any]]:
     """
     Xác định ý định và thực thi Parameterized Cypher định nghĩa sẵn.
     Đo thời gian thực tế của câu truy vấn Cypher và trả về `cypher_dur_ms`.
-    BẢO MẬT: Kiểm tra quyền truy cập dự án của auth_user trước khi thực thi.
+    BẢO MẬT: Bắt buộc auth_user hợp lệ. Mặc định từ chối nếu không có danh tính.
     """
+    if not auth_user:
+        return {
+            "intent": "PERMISSION_DENIED",
+            "cypher_duration_ms": 0.0,
+            "formatted_answer": "⛔ **Truy cập bị từ chối (401 Unauthorized):** Yêu cầu xác thực tài khoản để truy vấn số liệu dự án."
+        }
+
     q_lower = question.lower()
 
     # -------------------------------------------------------------------------
@@ -50,7 +57,7 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Optional[
         if proj_match:
             p_code, p_name = proj_match
             # RBAC Check: Nếu user không có quyền truy cập dự án này -> Từ chối ngay
-            if auth_user and not auth_user.can_access_project(p_code):
+            if not auth_user.can_access_project(p_code):
                 return {
                     "intent": "PERMISSION_DENIED",
                     "cypher_duration_ms": 0.0,
@@ -97,7 +104,7 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Optional[
         if proj_match:
             p_code, p_name = proj_match
             # RBAC Check
-            if auth_user and not auth_user.can_access_project(p_code):
+            if not auth_user.can_access_project(p_code):
                 return {
                     "intent": "PERMISSION_DENIED",
                     "cypher_duration_ms": 0.0,
@@ -138,7 +145,7 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Optional[
         else:
             # Câu hỏi toàn công ty: Chỉ Admin mới được quyền xem tổng kinh phí toàn công ty
             if any(k in q_lower for k in ["toàn công ty", "tất cả dự án", "toàn bộ dự án", "tổng công ty"]):
-                if auth_user and not auth_user.is_admin:
+                if not auth_user.is_admin:
                     return {
                         "intent": "PERMISSION_DENIED",
                         "cypher_duration_ms": 0.0,
@@ -185,7 +192,7 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Optional[
         if proj_match:
             p_code, p_name = proj_match
             # RBAC Check
-            if auth_user and not auth_user.can_access_project(p_code):
+            if not auth_user.can_access_project(p_code):
                 return {
                     "intent": "PERMISSION_DENIED",
                     "cypher_duration_ms": 0.0,
@@ -232,7 +239,7 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Optional[
         if proj_match:
             p_code, p_name = proj_match
             # RBAC Check
-            if auth_user and not auth_user.can_access_project(p_code):
+            if not auth_user.can_access_project(p_code):
                 return {
                     "intent": "PERMISSION_DENIED",
                     "cypher_duration_ms": 0.0,
