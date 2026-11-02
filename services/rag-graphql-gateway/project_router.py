@@ -1,20 +1,22 @@
 import logging
 import re
+import time
 from typing import Optional, Dict, Any, Tuple
 from neo4j import Driver
 
 logger = logging.getLogger("project-query-router")
 
-# Danh mục các mẫu câu hỏi định nghĩa sẵn (Whitelisted Templates)
-# Đảm bảo an toàn 100%, không cho phép LLM tự sinh Cypher tùy ý
-
 def match_project_in_question(question: str, driver: Driver) -> Optional[Tuple[str, str]]:
     """
     Tìm kiếm project_code hoặc tên dự án xuất hiện trong câu hỏi dựa trên CSDL Neo4j
     """
-    with driver.session() as session:
-        result = session.run("MATCH (p:Project) RETURN p.code AS code, p.name AS name")
-        projects = list(result)
+    try:
+        with driver.session() as session:
+            result = session.run("MATCH (p:Project) RETURN p.code AS code, p.name AS name")
+            projects = list(result)
+    except Exception as e:
+        logger.warning(f"Lỗi truy vấn danh sách dự án từ Neo4j: {e}")
+        return None
         
     q_lower = question.lower()
     for row in projects:
@@ -26,32 +28,16 @@ def match_project_in_question(question: str, driver: Driver) -> Optional[Tuple[s
             name_lower = name.lower()
             if name_lower in q_lower:
                 return code, name
-            # Lọc bỏ các từ tiền tố loại công trình như 'trạm biến áp', 'tba', 'đường dây', '110kv', '220kv', '500kv'
+            # Lọc bỏ tiền tố loại công trình như 'trạm biến áp', 'tba', 'đường dây', '110kv', '220kv', '500kv'
             cleaned_core = re.sub(r"(trạm biến áp|tba|đường dây|\d+kv)\s*", "", name_lower).strip()
             if len(cleaned_core) >= 4 and cleaned_core in q_lower:
                 return code, name
     return None
 
-def match_engineer_in_question(question: str, driver: Driver) -> Optional[Tuple[str, str]]:
-    """
-    Tìm tên kỹ sư xuất hiện trong câu hỏi
-    """
-    with driver.session() as session:
-        result = session.run("MATCH (e:Engineer) RETURN e.id AS id, e.name AS name")
-        engineers = list(result)
-        
-    q_lower = question.lower()
-    for row in engineers:
-        eng_id = row["id"]
-        eng_name = row["name"]
-        if eng_name and eng_name.lower() in q_lower:
-            return eng_id, eng_name
-    return None
-
 def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str, Any]]:
     """
-    Xác định ý định và thực thi Cypher định nghĩa sẵn có tham số (Parameterized Cypher).
-    Trả về Dict kết quả nếu khớp câu hỏi cấu trúc, ngược lại trả về None.
+    Xác định ý định và thực thi Parameterized Cypher định nghĩa sẵn.
+    Đo thời gian thực tế của câu truy vấn Cypher và trả về `cypher_dur_ms`.
     """
     q_lower = question.lower()
 
@@ -73,76 +59,111 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
                    sum(CASE WHEN t.status = 'Chưa làm' THEN 1 ELSE 0 END) AS pending_tasks,
                    avg(coalesce(t.progress, 0.0)) * 100 AS avg_progress_percent
             """
+            c_start = time.perf_counter()
             with driver.session() as session:
                 rec = session.run(cypher, code=p_code).single()
-                if rec and rec["total_work_tasks"] > 0:
-                    avg_p = round(rec["avg_progress_percent"] or 0.0, 1)
-                    return {
-                        "intent": "PROJECT_PROGRESS",
-                        "project_code": p_code,
-                        "project_name": rec["project_name"],
-                        "raw_data": dict(rec),
-                        "formatted_answer": (
-                            f"📊 **Báo cáo tiến độ dự án: {rec['project_name']} ({p_code})**\n\n"
-                            f"- **Tiến độ trung bình các task (loại trừ tiêu đề mục):** `{avg_p}%`\n"
-                            f"- **Tổng số hạng mục công việc thực tế:** {rec['total_work_tasks']}\n"
-                            f"- **Đã hoàn thành:** {rec['completed_tasks']} hạng mục\n"
-                            f"- **Đang thi công:** {rec['in_progress_tasks']} hạng mục\n"
-                            f"- **Chưa thực hiện:** {rec['pending_tasks']} hạng mục\n\n"
-                            f"*(Lưu ý: Chỉ số tiến độ được tính bằng trung bình cộng tỷ lệ hoàn thành của các task thành phần không phải tiêu đề mục)*"
-                        )
-                    }
+            c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+            if rec and rec["total_work_tasks"] > 0:
+                avg_p = round(rec["avg_progress_percent"] or 0.0, 1)
+                return {
+                    "intent": "PROJECT_PROGRESS",
+                    "project_code": p_code,
+                    "project_name": rec["project_name"],
+                    "cypher_duration_ms": c_dur,
+                    "raw_data": dict(rec),
+                    "formatted_answer": (
+                        f"📊 **Báo cáo tiến độ dự án: {rec['project_name']} ({p_code})**\n\n"
+                        f"- **Tiến độ trung bình các task (loại trừ tiêu đề mục):** `{avg_p}%`\n"
+                        f"- **Tổng số hạng mục công việc thực tế:** {rec['total_work_tasks']}\n"
+                        f"- **Đã hoàn thành:** {rec['completed_tasks']} hạng mục\n"
+                        f"- **Đang thi công:** {rec['in_progress_tasks']} hạng mục\n"
+                        f"- **Chưa thực hiện:** {rec['pending_tasks']} hạng mục\n\n"
+                        f"*(Lưu ý: Chỉ số tiến độ được tính bằng trung bình cộng tỷ lệ hoàn thành của các task thành phần không phải tiêu đề mục)*"
+                    )
+                }
 
     # -------------------------------------------------------------------------
-    # INTENT 2: Thống kê chi phí / tạm ứng dự án (sử dụng total_amount)
+    # INTENT 2: Thống kê chi phí / tạm ứng dự án
+    # Chỉ trả kết quả khi có phạm vi rõ ràng:
+    # - Có tên dự án cụ thể -> Trả chi phí dự án đó
+    # - Có từ khóa rõ ràng chỉ toàn công ty ("toàn công ty", "toàn bộ", "tất cả dự án", "công ty") -> Trả chi phí công ty
+    # - Nếu hỏi mơ hồ ("chi phí là bao nhiêu", "hết bao nhiêu tiền") -> Yêu cầu chỉ rõ phạm vi
     # -------------------------------------------------------------------------
-    if any(k in q_lower for k in ["chi phí", "tổng chi", "tạm ứng", "tiền ăn", "kinh phí", "tiêu bao nhiêu"]):
+    if any(k in q_lower for k in ["chi phí", "tổng chi", "tạm ứng", "kinh phí", "tiêu bao nhiêu"]):
         proj_match = match_project_in_question(question, driver)
-        p_code = proj_match[0] if proj_match else None
-        p_name = proj_match[1] if proj_match else "Toàn công ty"
 
-        if p_code:
+        if proj_match:
+            p_code, p_name = proj_match
             cypher = """
             MATCH (p:Project {code: $code})-[:INCURRED_EXPENSE]->(e:Expense)
             RETURN p.name AS project_name,
                    count(e) AS expense_count,
-                   sum(coalesce(e.total_amount, 0.0)) AS total_expenses_vnd,
-                   collect({content: e.content, amount: e.total_amount, spender: e.spender_name, date: e.date})[0..5] AS sample_expenses
+                   sum(coalesce(e.total_amount, 0.0)) AS total_expenses_vnd
             """
+            c_start = time.perf_counter()
             with driver.session() as session:
                 rec = session.run(cypher, code=p_code).single()
-                if rec and rec["expense_count"] > 0:
-                    total_vnd = f"{int(rec['total_expenses_vnd']):,}".replace(",", ".")
-                    return {
-                        "intent": "PROJECT_EXPENSES",
-                        "project_code": p_code,
-                        "project_name": p_name,
-                        "raw_data": dict(rec),
-                        "formatted_answer": (
-                            f"💰 **Thống kê chi phí dự án: {p_name} ({p_code})**\n\n"
-                            f"- **Tổng chi phí đã ghi nhận:** `{total_vnd} VNĐ`\n"
-                            f"- **Tổng số phiếu/khoản chi:** {rec['expense_count']} giao dịch\n"
-                            f"- Nguồn dữ liệu: Bảng chi phí thực tế (`total_amount`) đã được hạch toán."
-                        )
-                    }
-        else:
-            # Tổng chi phí toàn công ty
+            c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+            if rec and rec["expense_count"] > 0:
+                total_vnd = f"{int(rec['total_expenses_vnd']):,}".replace(",", ".")
+                return {
+                    "intent": "PROJECT_EXPENSES",
+                    "project_code": p_code,
+                    "project_name": p_name,
+                    "cypher_duration_ms": c_dur,
+                    "raw_data": dict(rec),
+                    "formatted_answer": (
+                        f"💰 **Thống kê chi phí dự án: {p_name} ({p_code})**\n\n"
+                        f"- **Tổng chi phí đã ghi nhận:** `{total_vnd} VNĐ`\n"
+                        f"- **Tổng số phiếu/khoản chi:** {rec['expense_count']} giao dịch\n"
+                        f"- Nguồn dữ liệu: Bảng chi phí thực tế (`total_amount`) đã được hạch toán."
+                    )
+                }
+            else:
+                return {
+                    "intent": "PROJECT_EXPENSES",
+                    "project_code": p_code,
+                    "project_name": p_name,
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": f"💰 Dự án **{p_name} ({p_code})** hiện chưa ghi nhận khoản chi phí hoặc phiếu chi nào trong hệ thống."
+                }
+
+        # Nếu câu hỏi nói rõ phạm vi toàn công ty
+        is_explicit_company = any(k in q_lower for k in ["toàn công ty", "toàn bộ", "tất cả dự án", "cả công ty", "kho tổng"])
+        if is_explicit_company:
             cypher = """
             MATCH (e:Expense)
             RETURN count(e) AS expense_count,
                    sum(coalesce(e.total_amount, 0.0)) AS total_expenses_vnd
             """
+            c_start = time.perf_counter()
             with driver.session() as session:
                 rec = session.run(cypher).single()
-                if rec:
-                    total_vnd = f"{int(rec['total_expenses_vnd']):,}".replace(",", ".")
-                    return {
-                        "intent": "ALL_EXPENSES",
-                        "formatted_answer": (
-                            f"💰 **Tổng chi phí toàn công ty:** `{total_vnd} VNĐ` "
-                            f"(trên tổng số {rec['expense_count']} khoản chi phí đã ghi nhận)."
-                        )
-                    }
+            c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+            if rec:
+                total_vnd = f"{int(rec['total_expenses_vnd']):,}".replace(",", ".")
+                return {
+                    "intent": "ALL_EXPENSES",
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": (
+                        f"💰 **Tổng chi phí toàn công ty:** `{total_vnd} VNĐ` "
+                        f"(trên tổng số {rec['expense_count']} khoản chi phí đã ghi nhận)."
+                    )
+                }
+
+        # Câu hỏi hỏi chi phí nhưng mơ hồ không rõ phạm vi
+        return {
+            "intent": "AMBIGUOUS_EXPENSE_QUERY",
+            "cypher_duration_ms": 0.0,
+            "formatted_answer": (
+                "❓ **Yêu cầu làm rõ phạm vi chi phí:**\n\n"
+                "Bạn đang muốn tra cứu chi phí của **dự án cụ thể nào** (ví dụ: *'Chi phí dự án Phước Đông 6'*, *'Chi phí dự án Lục Yên'*) "
+                "hay muốn xem **tổng chi phí toàn công ty** (*'Tổng chi phí toàn công ty là bao nhiêu'*)? Vui lòng cung cấp tên dự án để hệ thống hạch toán chính xác."
+            )
+        }
 
     # -------------------------------------------------------------------------
     # INTENT 3: Người quản lý / Kỹ sư phụ trách dự án
@@ -160,48 +181,86 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
                    mgr.title AS manager_title,
                    collect(DISTINCT eng.name) AS assigned_engineers
             """
+            c_start = time.perf_counter()
             with driver.session() as session:
                 rec = session.run(cypher, code=p_code).single()
-                if rec:
-                    mgr = rec["manager_name"] or "(Chưa cập nhật)"
-                    engs = [e for e in rec["assigned_engineers"] if e]
-                    eng_str = ", ".join(engs) if engs else "Chưa có kỹ sư gán cụ thể"
-                    return {
-                        "intent": "PROJECT_MANAGERS",
-                        "formatted_answer": (
-                            f"👷 **Nhân sự phụ trách dự án: {rec['project_name']} ({p_code})**\n\n"
-                            f"- **Người quản lý dự án (Project Manager):** **{mgr}**\n"
-                            f"- **Các kỹ sư tham gia thực hiện nhiệm vụ:** {eng_str}"
-                        )
-                    }
+            c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+            if rec:
+                mgr = rec["manager_name"] or "(Chưa cập nhật)"
+                engs = [e for e in rec["assigned_engineers"] if e]
+                eng_str = ", ".join(engs) if engs else "Chưa có kỹ sư gán cụ thể"
+                return {
+                    "intent": "PROJECT_MANAGERS",
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": (
+                        f"👷 **Nhân sự phụ trách dự án: {rec['project_name']} ({p_code})**\n\n"
+                        f"- **Người quản lý dự án (Project Manager):** **{mgr}**\n"
+                        f"- **Các kỹ sư tham gia thực hiện nhiệm vụ:** {eng_str}"
+                    )
+                }
 
     # -------------------------------------------------------------------------
-    # INTENT 4: Danh mục vật tư / tồn kho dự án
+    # INTENT 4: Danh mục vật tư / Đơn hàng mua sắm
+    # Chỉ trả lời khi template đáp ứng chính xác câu hỏi; từ chối trả lời phỏng đoán
     # -------------------------------------------------------------------------
-    if any(k in q_lower for k in ["vật tư", "tồn kho", "thiết bị", "kế hoạch vật tư"]):
+    if any(k in q_lower for k in ["vật tư chưa đặt", "chưa đặt hàng", "vật tư chưa có"]):
         proj_match = match_project_in_question(question, driver)
         if proj_match:
             p_code, p_name = proj_match
             cypher = """
-            MATCH (p:Project {code: $code})
-            OPTIONAL MATCH (p)-[:REQUIRES_MATERIAL]->(mp:MaterialPlan)
-            OPTIONAL MATCH (p)-[:STOCKS_MATERIAL]->(m:Material)
+            MATCH (p:Project {code: $code})-[:HAS_PURCHASE_PLAN]->(pp:PurchasingPlan)
+            WHERE pp.order_status = 'Chưa đặt hàng' OR pp.order_status IS NULL
             RETURN p.name AS project_name,
-                   count(DISTINCT mp) AS plan_count,
-                   count(DISTINCT m) AS stock_material_count,
-                   collect(DISTINCT m.name)[0..5] AS sample_materials
+                   count(pp) AS pending_orders_count,
+                   collect(pp.content)[0..5] AS sample_items
             """
+            c_start = time.perf_counter()
             with driver.session() as session:
                 rec = session.run(cypher, code=p_code).single()
-                if rec and (rec["plan_count"] > 0 or rec["stock_material_count"] > 0):
-                    sample_str = ", ".join(rec["sample_materials"]) if rec["sample_materials"] else ""
-                    stock_info = f"\n- **Số mã vật tư trong kho dự án:** {rec['stock_material_count']} (Ví dụ: {sample_str})" if rec["stock_material_count"] > 0 else ""
-                    return {
-                        "intent": "PROJECT_MATERIALS",
-                        "formatted_answer": (
-                            f"📦 **Tình hình vật tư dự án: {rec['project_name']} ({p_code})**\n\n"
-                            f"- **Tổng số danh mục trong Kế hoạch vật tư:** {rec['plan_count']} đầu mục{stock_info}"
-                        )
-                    }
+            c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+            if rec and rec["pending_orders_count"] > 0:
+                sample_str = "\n".join([f"  - {it}" for it in rec["sample_items"] if it])
+                return {
+                    "intent": "PENDING_PURCHASE_ORDERS",
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": (
+                        f"📦 **Vật tư chưa đặt hàng thuộc dự án: {rec['project_name']} ({p_code})**\n\n"
+                        f"- **Tổng số hạng mục chưa đặt hàng:** {rec['pending_orders_count']} mục\n"
+                        f"- **Một số hạng mục tiêu biểu:**\n{sample_str}"
+                    )
+                }
+            else:
+                return {
+                    "intent": "PENDING_PURCHASE_ORDERS",
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": f"📦 Dự án **{p_name} ({p_code})** hiện không có hạng mục nào ở trạng thái 'Chưa đặt hàng'."
+                }
+
+    if any(k in q_lower for k in ["tổng số vật tư", "kế hoạch vật tư", "danh mục vật tư"]):
+        proj_match = match_project_in_question(question, driver)
+        if proj_match:
+            p_code, p_name = proj_match
+            cypher = """
+            MATCH (p:Project {code: $code})-[:REQUIRES_MATERIAL]->(mp:MaterialPlan)
+            RETURN p.name AS project_name,
+                   count(mp) AS plan_count
+            """
+            c_start = time.perf_counter()
+            with driver.session() as session:
+                rec = session.run(cypher, code=p_code).single()
+            c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+            if rec and rec["plan_count"] > 0:
+                return {
+                    "intent": "PROJECT_MATERIALS_SUMMARY",
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": (
+                        f"📦 **Kế hoạch vật tư dự án: {rec['project_name']} ({p_code})**\n\n"
+                        f"- **Tổng số danh mục trong Kế hoạch vật tư:** {rec['plan_count']} đầu mục.\n"
+                        f"*(Để tra cứu chi tiết tiến độ đặt hàng, vui lòng hỏi: 'Vật tư nào chưa đặt hàng thuộc dự án {p_name}')*"
+                    )
+                }
 
     return None

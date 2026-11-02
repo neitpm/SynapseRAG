@@ -24,7 +24,7 @@ sys.path.append(str(ROOT_DIR))
 
 from shared.config import settings
 from wiki_dynamic import extract_keyword_candidate, fetch_and_store_wiki_on_demand
-from project_router import execute_structured_query
+from project_router import execute_structured_query, match_project_in_question
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rag-graphql-gateway")
@@ -209,6 +209,7 @@ def execute_rag_pipeline(
             "details": f"Đã định tuyến chính xác ý định: {structured_res.get('intent')}.",
             "metrics": [{"key": "intent", "value": structured_res.get("intent")}]
         })
+        cypher_real_dur = structured_res.get("cypher_duration_ms", 0.0)
         notify("step_start", {
             "step_id": 2,
             "name": "2. Parameterized Cypher Analytics",
@@ -220,10 +221,13 @@ def execute_rag_pipeline(
             "step_id": 2,
             "name": "2. Parameterized Cypher Analytics",
             "status": "SUCCESS",
-            "duration_ms": 15.0,
+            "duration_ms": cypher_real_dur,
             "active_node": "neo4j",
-            "details": "Truy vấn đồ thị quan hệ thành công. Trích xuất số liệu hạch toán.",
-            "metrics": [{"key": "query_type", "value": "Deterministic Cypher Aggregation"}]
+            "details": f"Truy vấn đồ thị quan hệ thành công ({cypher_real_dur}ms). Trích xuất số liệu hạch toán.",
+            "metrics": [
+                {"key": "query_type", "value": "Deterministic Cypher Aggregation"},
+                {"key": "measured_latency_ms", "value": str(cypher_real_dur)}
+            ]
         })
 
         formatted_answer = structured_res.get("formatted_answer", "")
@@ -459,11 +463,15 @@ def execute_rag_pipeline(
                     has_matched_article = True
                     break
 
-        # TẮT on-demand Wikipedia crawl nếu câu hỏi liên quan đến nội bộ công ty/dự án/vật tư
-        is_internal_query = any(k in question.lower() for k in [
+        # KIỂM SOÁT BẢO MẬT: Nhận diện động mọi dự án tồn tại trong Neo4j
+        # Tuyệt đối không gửi từ khóa / tên dự án ra ngoài Wikipedia dù router chưa có intent
+        matched_proj = match_project_in_question(question, neo4j_driver)
+        is_internal_project = (matched_proj is not None)
+        is_internal_keyword = any(k in question.lower() for k in [
             "dự án", "trạm biến áp", "tba", "đường dây", "tiến độ", "vật tư", "chi phí", "kỹ sư", 
-            "công trường", "kho", "phước đông", "lục yên", "năm căn", "tây ninh", "bắc ninh", "nam cấm"
+            "công trường", "kho", "phụ trách", "tiền ăn", "tạm ứng"
         ])
+        is_internal_query = is_internal_project or is_internal_keyword
 
         # Nếu chưa có bài viết cho chủ đề này và không phải câu hỏi nội bộ
         if (len(sources) == 0 or not has_matched_article) and not is_internal_query:
