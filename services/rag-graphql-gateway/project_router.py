@@ -291,10 +291,10 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                         )
                     }
 
-                # 1. Truy vấn Bảng xếp hạng Top 5 Dự án công trình (CONSTRUCTION)
+                # 1. Truy vấn Bảng xếp hạng Top 5 Dự án công trình xây lắp (chỉ lấy đúng project_type = 'CONSTRUCTION')
                 cypher_construction = """
                 MATCH (p:Project)-[:INCURRED_EXPENSE]->(e:Expense)
-                WHERE coalesce(p.project_type, 'CONSTRUCTION') = 'CONSTRUCTION'
+                WHERE p.project_type = 'CONSTRUCTION'
                 WITH p, count(e) AS expense_count, sum(coalesce(e.total_amount, 0.0)) AS total_cost
                 ORDER BY total_cost DESC
                 LIMIT 5
@@ -306,7 +306,7 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                 # 2. Truy vấn riêng các hạng mục Chi phí vận hành / Quản lý nội bộ (OPERATIONAL)
                 cypher_operational = """
                 MATCH (p:Project)-[:INCURRED_EXPENSE]->(e:Expense)
-                WHERE p.project_type = 'OPERATIONAL' OR p.code IN ['CHI_PHI_VAN_PHONG']
+                WHERE p.project_type = 'OPERATIONAL'
                 WITH p, count(e) AS expense_count, sum(coalesce(e.total_amount, 0.0)) AS total_cost
                 ORDER BY total_cost DESC
                 RETURN p.name AS project_name,
@@ -314,14 +314,22 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                        expense_count,
                        total_cost
                 """
+                # 3. Kiểm tra cảnh báo dữ liệu: Các node Project có phát sinh chi phí nhưng thiếu project_type
+                cypher_unclassified = """
+                MATCH (p:Project)-[:INCURRED_EXPENSE]->(e:Expense)
+                WHERE p.project_type IS NULL OR trim(p.project_type) = ''
+                RETURN count(DISTINCT p) AS unclassified_count, collect(DISTINCT p.code) AS unclassified_codes
+                """
                 c_start = time.perf_counter()
                 with driver.session() as session:
                     construction_records = list(session.run(cypher_construction))
                     operational_records = list(session.run(cypher_operational))
+                    unclass_res = session.run(cypher_unclassified).single()
                 c_dur = round((time.perf_counter() - c_start) * 1000, 2)
 
                 if construction_records or operational_records:
                     lines = ["🏆 **BẢNG XẾP HẠNG TOP DỰ ÁN CÔNG TRÌNH CÓ CHI PHÍ CAO NHẤT:**\n"]
+                    lines.append("*(Bảng chỉ xếp hạng các dự án xây lắp công trình `CONSTRUCTION`, không bao gồm hợp đồng thương mại `COMMERCIAL`)*\n")
                     for idx, r in enumerate(construction_records, start=1):
                         cost_str = f"{r['total_cost']:,.0f} VNĐ"
                         lines.append(f"{idx}. **{r['project_name']}** (`{r['project_code']}`): **{cost_str}** ({r['expense_count']} phiếu chi)")
@@ -332,7 +340,10 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                             cost_str = f"{r['total_cost']:,.0f} VNĐ"
                             lines.append(f"- **{r['project_name']}** (`{r['project_code']}`): **{cost_str}** ({r['expense_count']} phiếu chi)")
 
-                    lines.append("\n*(Dữ liệu phân loại theo thuộc tính nghiệp vụ `project_type: CONSTRUCTION vs OPERATIONAL` từ CSDL đồ thị)*")
+                    if unclass_res and unclass_res["unclassified_count"] > 0:
+                        lines.append(f"\n⚠️ **Cảnh báo chất lượng dữ liệu:** Có {unclass_res['unclassified_count']} node Project chưa phân loại `project_type` ({unclass_res['unclassified_codes']}) nên không được đưa vào bảng xếp hạng.")
+
+                    lines.append("\n*(Dữ liệu phân loại tường minh theo thuộc tính nghiệp vụ `project_type: CONSTRUCTION vs OPERATIONAL` từ CSDL đồ thị)*")
                     return {
                         "intent": "TOP_EXPENSE_PROJECTS_RANKING",
                         "cypher_duration_ms": c_dur,
