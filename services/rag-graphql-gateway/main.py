@@ -5,7 +5,7 @@ import json
 import asyncio
 import urllib.request
 from pathlib import Path
-from typing import List, Optional, AsyncGenerator, Dict, Any
+from typing import List, Optional, AsyncGenerator, Dict, Any, Tuple
 import strawberry
 from fastapi import FastAPI, Query as FastAPIQuery
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,7 +24,7 @@ sys.path.append(str(ROOT_DIR))
 
 from shared.config import settings
 from wiki_dynamic import extract_keyword_candidate, fetch_and_store_wiki_on_demand
-from project_router import execute_structured_query, match_project_in_question
+from project_router import execute_structured_query, match_project_in_question, is_internal_query_context
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rag-graphql-gateway")
@@ -252,6 +252,21 @@ def execute_rag_pipeline(
             "active_edge": "neo4j_to_result" if intent != "AMBIGUOUS_EXPENSE_QUERY" else "gateway_to_result"
         })
         return formatted_answer, [], steps, total_ms
+
+    # =========================================================================
+    # NHÁNH 2: EXTRACTIVE RAG CHO DỮ LIỆU NỘI BỘ (Nhật trình, sự cố, ghi chú)
+    # Tuyệt đối không gửi sang Gemini API, không crawl Wikipedia ngầm
+    # =========================================================================
+    matched_proj = match_project_in_question(question, neo4j_driver)
+    if is_internal_query_context(question, neo4j_driver):
+        logger.info(f"🔒 Chuyển sang Extractive RAG Nội bộ cho câu hỏi: '{question[:60]}' (Project: {matched_proj})")
+        return run_internal_extractive_pipeline(
+            question=question,
+            top_k=top_k,
+            collect_debug=collect_debug,
+            progress_callback=progress_callback,
+            target_project=matched_proj
+        )
 
     # ----------------------------------------------------
     # BƯỚC 1: Embedding câu hỏi (Bên trong Gateway)
@@ -579,6 +594,281 @@ def execute_rag_pipeline(
     })
 
     return answer, sources, steps, total_ms
+
+
+def run_internal_extractive_pipeline(
+    question: str,
+    top_k: int = 5,
+    collect_debug: bool = False,
+    progress_callback: Optional[Any] = None,
+    target_project: Optional[Tuple[str, str]] = None
+) -> tuple[str, list[dict], list[DebugStep], float]:
+    """
+    Extractive RAG thuần túy cho Dữ liệu Nội bộ:
+    1. Nhúng câu hỏi cục bộ (all-MiniLM-L6-v2)
+    2. Overfetch ứng viên từ Neo4j: Vector Cosine + BM25 Fulltext (internal_chunk_vector_index & internal_chunk_fulltext_index)
+    3. Lọc theo project_code (nếu có ngữ cảnh dự án) và re-rank theo BM25Okapi tiếng Việt
+    4. Trả về đoạn trích nguyên văn và trích dẫn lineage (source_table, source_id, project_code, date)
+    5. TUYỆT ĐỐI:
+       - KHÔNG gửi dữ liệu ra ngoài (không gọi Gemini API)
+       - KHÔNG fallback ngầm sang Wikipedia
+       - KHÔNG trả created_by ra client khi chưa có cơ chế RBAC
+    """
+    t_start = time.perf_counter()
+    steps: List[DebugStep] = []
+    sources: list[dict] = []
+
+    def notify(event_type: str, data: dict):
+        if progress_callback:
+            progress_callback(event_type, data)
+
+    target_code = target_project[0] if target_project else None
+    target_name = target_project[1] if target_project else None
+
+    # Step 1: Query Router Notification
+    notify("step_start", {
+        "step_id": 1,
+        "name": "1. Project Internal Extractive Router",
+        "active_node": "gateway",
+        "active_edge": "client_to_gateway",
+        "details": f"Định tuyến sang Extractive RAG Nội bộ (Dự án: {target_name or 'Toàn hệ thống nội bộ'}). Đảm bảo cách ly 100% dữ liệu."
+    })
+    step1_dur = round((time.perf_counter() - t_start) * 1000, 2)
+    notify("step_complete", {
+        "step_id": 1,
+        "name": "1. Project Internal Extractive Router",
+        "status": "SUCCESS",
+        "duration_ms": step1_dur,
+        "active_node": "gateway",
+        "details": "Đã chuyển nhánh Extractive RAG nội bộ. Không sử dụng external LLM.",
+        "metrics": [
+            {"key": "mode", "value": "Extractive RAG (Zero-leakage, No external LLM)"},
+            {"key": "target_project", "value": f"{target_name} ({target_code})" if target_code else "All internal"}
+        ]
+    })
+
+    # Step 2: Embedding câu hỏi cục bộ
+    notify("step_start", {
+        "step_id": 2,
+        "name": "2. Local Question Embedding",
+        "active_node": "gateway",
+        "active_edge": "client_to_gateway",
+        "details": f"Nhúng câu hỏi nội bộ cục bộ bằng '{settings.EMBEDDING_MODEL}' (384-dims)..."
+    })
+    emb_start = time.perf_counter()
+    q_vec = embedder.encode(question).tolist()
+    emb_dur = round((time.perf_counter() - emb_start) * 1000, 2)
+    notify("step_complete", {
+        "step_id": 2,
+        "name": "2. Local Question Embedding",
+        "status": "SUCCESS",
+        "duration_ms": emb_dur,
+        "active_node": "gateway",
+        "details": f"Đã sinh vector 384 chiều cục bộ ({emb_dur}ms).",
+        "metrics": [{"key": "vector_dimensions", "value": "384"}]
+    })
+
+    # Step 3: Hybrid Retrieval trên Neo4j (Vector Cosine + BM25 Fulltext)
+    notify("step_start", {
+        "step_id": 3,
+        "name": "3. Internal Vector & Fulltext Hybrid Retrieval",
+        "active_node": "neo4j",
+        "active_edge": "gateway_to_neo4j",
+        "details": "Truy xuất ứng viên từ 'internal_chunk_vector_index' & 'internal_chunk_fulltext_index', lọc theo project_code..."
+    })
+    retrieval_start = time.perf_counter()
+
+    query_words = re.findall(r"\w+", question.lower())
+    ft_query_str = " OR ".join([w for w in query_words if len(w) > 1]) if query_words else question
+    fetch_k = max(top_k * 5, 50)
+
+    candidate_pool: dict[str, dict] = {}
+    try:
+        with neo4j_driver.session() as session:
+            v_res = session.run("""
+                CALL db.index.vector.queryNodes('internal_chunk_vector_index', $fetch_k, $q_vec)
+                YIELD node, score
+                RETURN node.chunk_id AS chunk_id,
+                       node.source_table AS source_table,
+                       node.source_id AS source_id,
+                       node.project_code AS project_code,
+                       node.date AS date,
+                       node.text AS text,
+                       score AS vector_score
+            """, {"fetch_k": fetch_k, "q_vec": q_vec}).data()
+
+            ft_res = []
+            try:
+                ft_res = session.run("""
+                    CALL db.index.fulltext.queryNodes('internal_chunk_fulltext_index', $ft_query)
+                    YIELD node, score
+                    RETURN node.chunk_id AS chunk_id,
+                           node.source_table AS source_table,
+                           node.source_id AS source_id,
+                           node.project_code AS project_code,
+                           node.date AS date,
+                           node.text AS text,
+                           score AS bm25_score
+                    LIMIT $fetch_k
+                """, {"ft_query": ft_query_str, "fetch_k": fetch_k}).data()
+            except Exception as fte:
+                logger.warning(f"Lỗi truy vấn fulltext index: {fte}")
+
+            for r in v_res:
+                cid = r["chunk_id"]
+                candidate_pool[cid] = {
+                    "chunk_id": cid,
+                    "source_table": r["source_table"],
+                    "source_id": r["source_id"],
+                    "project_code": r["project_code"],
+                    "date": r["date"],
+                    "text": r["text"],
+                    "vector_score": float(r["vector_score"]),
+                    "bm25_score": 0.0
+                }
+
+            for r in ft_res:
+                cid = r["chunk_id"]
+                if cid in candidate_pool:
+                    candidate_pool[cid]["bm25_score"] = float(r["bm25_score"])
+                else:
+                    candidate_pool[cid] = {
+                        "chunk_id": cid,
+                        "source_table": r["source_table"],
+                        "source_id": r["source_id"],
+                        "project_code": r["project_code"],
+                        "date": r["date"],
+                        "text": r["text"],
+                        "vector_score": 0.5,
+                        "bm25_score": float(r["bm25_score"])
+                    }
+
+        cand_list = list(candidate_pool.values())
+
+        # Lọc kết quả bằng project_code trước khi trả citations (nếu có dự án cụ thể)
+        if target_code:
+            cand_list = [c for c in cand_list if c["project_code"] == target_code]
+
+        if cand_list:
+            tokenized_corpus = [re.findall(r"\w+", c["text"].lower()) for c in cand_list]
+            bm25_calc = BM25Okapi(tokenized_corpus)
+            python_bm25_scores = bm25_calc.get_scores(query_words)
+            max_bm = max(python_bm25_scores) if len(python_bm25_scores) > 0 else 1.0
+            min_bm = min(python_bm25_scores) if len(python_bm25_scores) > 0 else 0.0
+            rng_bm = (max_bm - min_bm) if (max_bm - min_bm) > 1e-6 else 1.0
+
+            for i, c in enumerate(cand_list):
+                norm_bm = (python_bm25_scores[i] - min_bm) / rng_bm
+                c["hybrid_score"] = round(0.6 * c["vector_score"] + 0.4 * norm_bm, 4)
+
+            cand_list.sort(key=lambda x: x["hybrid_score"], reverse=True)
+            final_chunks = cand_list[:top_k]
+        else:
+            final_chunks = []
+
+        retrieval_dur = round((time.perf_counter() - retrieval_start) * 1000, 2)
+        notify("step_complete", {
+            "step_id": 3,
+            "name": "3. Internal Vector & Fulltext Hybrid Retrieval",
+            "status": "SUCCESS",
+            "duration_ms": retrieval_dur,
+            "active_node": "neo4j",
+            "details": f"Tìm thấy {len(final_chunks)} đoạn trích phù hợp ({retrieval_dur}ms).",
+            "metrics": [
+                {"key": "candidates_evaluated", "value": str(len(cand_list))},
+                {"key": "top_matches_selected", "value": str(len(final_chunks))},
+                {"key": "project_filter_applied", "value": target_code or "None"}
+            ]
+        })
+    except Exception as e:
+        logger.error(f"Lỗi khi truy xuất Extractive RAG: {e}")
+        retrieval_dur = round((time.perf_counter() - retrieval_start) * 1000, 2)
+        notify("step_failed", {
+            "step_id": 3,
+            "name": "3. Internal Vector & Fulltext Hybrid Retrieval",
+            "status": "FAILED",
+            "duration_ms": retrieval_dur,
+            "error": "Lỗi truy vấn dữ liệu nội bộ."
+        })
+        final_chunks = []
+
+    # Step 4: Trình bày trích dẫn nguyên văn (Extractive Synthesis)
+    notify("step_start", {
+        "step_id": 4,
+        "name": "4. Extractive Lineage & Citation Assembly",
+        "active_node": "gateway",
+        "active_edge": "neo4j_to_gateway",
+        "details": "Đóng gói các đoạn trích nguyên văn và metadata nguồn (Loại trừ created_by bảo vệ quyền riêng tư)..."
+    })
+    synthesis_start = time.perf_counter()
+
+    if final_chunks:
+        lines = []
+        if target_name:
+            lines.append(f"🔍 **Kết quả trích xuất nhật trình & ghi chú dự án: {target_name} ({target_code})**\n")
+        else:
+            lines.append("🔍 **Kết quả trích xuất nhật trình & ghi chú kỹ thuật nội bộ:**\n")
+
+        for idx, c in enumerate(final_chunks, 1):
+            src_table = c["source_table"]
+            src_id = c["source_id"]
+            pcode = c["project_code"]
+            date_str = f" | Ngày: {c['date']}" if c.get("date") else ""
+            table_vn = {
+                "field_logs": "Nhật trình hiện trường",
+                "tasks": "Nhiệm vụ công việc",
+                "material_plans": "Kế hoạch vật tư / Thiết bị"
+            }.get(src_table, src_table)
+
+            # Metadata trích dẫn đầy đủ, không lộ created_by
+            lines.append(f"### {idx}. Nguồn: `{table_vn}` ({src_table}){date_str}")
+            lines.append(f"- **Mã dự án:** `{pcode}` | **Bản ghi gốc (ID):** `{src_id}`")
+            lines.append(f"- **Độ khớp (Hybrid Score):** `{c['hybrid_score']:.4f}`")
+            lines.append("```text")
+            lines.append(c["text"].strip())
+            lines.append("```\n")
+
+            sources.append({
+                "chunk_id": c["chunk_id"],
+                "article_title": f"{table_vn} ({pcode})",
+                "article_url": None,
+                "score": c["hybrid_score"],
+                "text": c["text"],
+                "related_categories": [src_table, pcode],
+                "mentioned_articles": []
+            })
+
+        lines.append("*(Ghi chú an toàn: Toàn bộ nội dung trên được trích xuất nguyên văn trực tiếp từ CSDL nội bộ. Không gửi dữ liệu sang LLM đám mây)*")
+        answer_text = "\n".join(lines)
+    else:
+        answer_text = (
+            f"⚠️ **Không tìm thấy ghi chú kỹ thuật hoặc nhật trình phù hợp** "
+            f"cho câu hỏi này trong dữ liệu nội bộ của dự án {target_name or ''}.\n"
+            f"*(Hệ thống tuân thủ nguyên tắc không tự suy diễn và không tự động crawl ngoài internet)*"
+        )
+
+    synthesis_dur = round((time.perf_counter() - synthesis_start) * 1000, 2)
+    notify("step_complete", {
+        "step_id": 4,
+        "name": "4. Extractive Lineage & Citation Assembly",
+        "status": "SUCCESS",
+        "duration_ms": synthesis_dur,
+        "active_node": "gateway",
+        "details": f"Đã đóng gói {len(sources)} trích dẫn nguyên văn ({synthesis_dur}ms).",
+        "metrics": [{"key": "created_by_redacted", "value": "true (RBAC Boundary Protected)"}]
+    })
+
+    total_ms = round((time.perf_counter() - t_start) * 1000, 2)
+    notify("pipeline_complete", {
+        "question": question,
+        "answer": answer_text,
+        "sources": sources,
+        "total_duration_ms": total_ms,
+        "active_node": "result",
+        "active_edge": "gateway_to_result"
+    })
+
+    return answer_text, sources, steps, total_ms
 
 
 # ============================================================================
