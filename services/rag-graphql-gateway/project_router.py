@@ -50,6 +50,64 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
     q_lower = question.lower()
 
     # -------------------------------------------------------------------------
+    # INTENT 0: Thống kê số lượng / Danh sách dự án trong hệ thống
+    # -------------------------------------------------------------------------
+    if any(k in q_lower for k in [
+        "bao nhiêu dự án", "số lượng dự án", "danh sách dự án", "có những dự án nào",
+        "liệt kê dự án", "dự án nào", "tổng số dự án"
+    ]) and not any(k in q_lower for k in ["chi phí", "tiến độ", "vật tư", "nhật trình"]):
+        if not auth_user.is_admin:
+            # Nếu là user thường: Chỉ hiển thị các dự án user được phân quyền
+            allowed = auth_user.allowed_projects
+            if not allowed:
+                return {
+                    "intent": "PROJECT_LIST_RBAC",
+                    "cypher_duration_ms": 0.0,
+                    "formatted_answer": f"Tài khoản của bạn (`{auth_user.user_id}`) hiện chưa được phân quyền truy cập dự án nào trong hệ thống."
+                }
+            cypher = """
+            MATCH (p:Project)
+            WHERE p.code IN $allowed
+            RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
+            """
+            c_start = time.perf_counter()
+            with driver.session() as session:
+                rec = session.run(cypher, allowed=allowed).single()
+            c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+            total = rec["total_projects"]
+            proj_items = "\n".join([f"- {name}" for name in rec["project_list"]])
+            return {
+                "intent": "PROJECT_LIST_RBAC",
+                "cypher_duration_ms": c_dur,
+                "formatted_answer": (
+                    f"📁 **Danh sách dự án bạn được phân quyền truy cập ({total} dự án):**\n\n"
+                    f"{proj_items}\n\n"
+                    f"*(Tài khoản: `{auth_user.user_id}` - Phân quyền theo dự án được gán)*"
+                )
+            }
+        else:
+            # Nếu là Admin: Hiển thị toàn bộ 24 dự án
+            cypher = """
+            MATCH (p:Project)
+            RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
+            """
+            c_start = time.perf_counter()
+            with driver.session() as session:
+                rec = session.run(cypher).single()
+            c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+            total = rec["total_projects"]
+            proj_items = "\n".join([f"- {name}" for name in rec["project_list"]])
+            return {
+                "intent": "PROJECT_LIST_ALL",
+                "cypher_duration_ms": c_dur,
+                "formatted_answer": (
+                    f"🏢 **Tổng quan hệ thống: Hiện có {total} dự án công trình đang quản lý:**\n\n"
+                    f"{proj_items}\n\n"
+                    f"*(Quyền Quản trị viên: Toàn quyền truy cập tất cả các dự án)*"
+                )
+            }
+
+    # -------------------------------------------------------------------------
     # INTENT 1: Tiến độ trung bình các task (loại trừ section header, quy đổi 0-1 sang %)
     # -------------------------------------------------------------------------
     if any(k in q_lower for k in ["tiến độ", "hoàn thành bao nhiêu", "%", "tiến độ trung bình"]):
@@ -330,6 +388,7 @@ def is_internal_query_context(question: str, driver: Driver) -> bool:
     internal_keywords = [
         "nhật trình", "hiện trường", "công trường", "sự cố", "phát sinh",
         "ghi chú", "quy cách", "tiêu chuẩn kỹ thuật", "vật tư", "kế hoạch",
-        "hạng mục", "joint box", "odf", "tiến độ", "chi phí", "hạch toán"
+        "hạng mục", "joint box", "odf", "tiến độ", "chi phí", "hạch toán",
+        "dự án", "công trình", "hợp đồng", "gói thầu"
     ]
     return any(k in q_lower for k in internal_keywords)
