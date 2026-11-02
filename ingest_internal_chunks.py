@@ -5,6 +5,7 @@ import logging
 import time
 import json
 import uuid
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -411,8 +412,8 @@ def chunk_list(lst, size=200):
 def perform_pre_swap_smoke_tests(session, staging_version: str, sample_chunk: dict) -> bool:
     """
     Smoke test retrieval thực tế trên Vector Index và Fulltext Index bằng dữ liệu đã biết của staging.
-    Xác nhận chính xác sample_id của chunk mẫu xuất hiện trong kết quả top-k để khẳng định HNSW index
-    đã index xong chunk vừa nạp.
+    Xác nhận chính xác sample_id của chunk mẫu xuất hiện trong kết quả top-k của CẢ 2 INDEX
+    để khẳng định HNSW vector index và Lucene fulltext index đã index xong chunk vừa nạp.
     """
     logger.info("🧪 Đang thực hiện Pre-swap Smoke Test Retrieval trên chính phiên bản staging...")
     
@@ -441,27 +442,57 @@ def perform_pre_swap_smoke_tests(session, staging_version: str, sample_chunk: di
         logger.error(f"❌ SMOKE TEST VECTOR ERROR: {e}")
         return False
 
-    # 2. Smoke test Fulltext Index với từ khóa thực tế từ text của sample_chunk
-    # Lấy các từ có độ dài >= 4 từ text thực tế
-    words = [w for w in sample_text.split() if len(w) >= 4 and w.isalnum()]
-    if not words:
-        words = ["công", "việc", "thiết", "bị"]
-    search_keyword = words[0]
+    # 2. Smoke test Fulltext Index - Trích xuất cụm từ / token đặc trưng và xác nhận chính xác sample_id
+    STOP_WORDS = {
+        "công", "việc", "thực", "hiện", "ngày", "dự", "án", "hạng", "mục",
+        "ghi", "chú", "tiêu", "chuẩn", "kỹ", "thuật", "thiết", "bị", "vật",
+        "tư", "yêu", "cầu", "xuất", "xứ", "nội", "dung", "trao", "đổi", "nhân", "sự",
+        "cho", "các", "nhà", "thầu", "import", "theo", "được", "trong", "ngoài"
+    }
+
+    # Tìm cụm 2 từ (bigram) có ý nghĩa trong văn bản để đạt độ phân giải tìm kiếm cao
+    words_in_text = [w for w in re.findall(r"\b\w+\b", sample_text.lower()) if len(w) >= 2 and not w.isdigit()]
+    phrases = []
+    for i in range(len(words_in_text) - 1):
+        w1, w2 = words_in_text[i], words_in_text[i + 1]
+        if w1 not in STOP_WORDS and w2 not in STOP_WORDS:
+            phrases.append(f'"{w1} {w2}"')
+        elif len(w1) >= 4 and w1 not in STOP_WORDS:
+            phrases.append(w1)
+
+    # Nếu không có bigram phù hợp, fallback sang các từ đơn lẻ dài nhất không nằm trong stop words
+    if not phrases:
+        single_words = [w for w in words_in_text if len(w) >= 4 and w not in STOP_WORDS]
+        single_words.sort(key=len, reverse=True)
+        search_query = single_words[0] if single_words else "chống cháy"
+    else:
+        # Chọn cụm từ dài nhất / đặc trưng nhất
+        phrases.sort(key=len, reverse=True)
+        search_query = phrases[0]
 
     ft_test_cypher = """
     CALL db.index.fulltext.queryNodes('internal_chunk_fulltext_index', $kw)
     YIELD node, score
     WHERE node.version = $version
     RETURN node.chunk_id AS chunk_id, score
-    LIMIT 20
+    LIMIT 150
     """
     try:
-        ft_results = session.run(ft_test_cypher, kw=search_keyword, version=staging_version).data()
+        ft_results = session.run(ft_test_cypher, kw=search_query, version=staging_version).data()
         ft_retrieved_ids = [r["chunk_id"] for r in ft_results]
-        if not ft_results:
-            logger.error(f"❌ SMOKE TEST FULLTEXT FAILED: Không tìm thấy kết quả cho từ khóa '{search_keyword}' trong staging version!")
+        
+        if sample_id not in ft_retrieved_ids:
+            logger.error(
+                f"❌ SMOKE TEST FULLTEXT FAILED: sample_id '{sample_id}' không xuất hiện trong top kết quả "
+                f"với search query đặc trưng '{search_query}' ({len(ft_retrieved_ids)} chunks tìm thấy)!"
+            )
             return False
-        logger.info(f"   ✅ Fulltext Index Test PASSED: Tìm thấy {len(ft_results)} chunk(s) với từ khóa '{search_keyword}'.")
+            
+        ft_score = next(r["score"] for r in ft_results if r["chunk_id"] == sample_id)
+        logger.info(
+            f"   ✅ Fulltext Index Test PASSED: Đã định vị chính xác sample_id '{sample_id}' "
+            f"với query '{search_query}' (Score: {ft_score:.4f}, Rank: {ft_retrieved_ids.index(sample_id) + 1}/{len(ft_retrieved_ids)})."
+        )
     except Exception as e:
         logger.error(f"❌ SMOKE TEST FULLTEXT ERROR: {e}")
         return False
