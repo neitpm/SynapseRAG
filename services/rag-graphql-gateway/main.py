@@ -745,12 +745,17 @@ def run_internal_extractive_pipeline(
     candidate_pool: dict[str, dict] = {}
     try:
         with neo4j_driver.session() as session:
-            # Cypher Vector Query có điều kiện RBAC ngay tại DB
+            # Lấy active_version hiện hành từ SystemConfig
+            cfg_res = session.run("MATCH (s:SystemConfig {id: 'internal_rag_state'}) RETURN s.active_version AS active_version").single()
+            active_version = cfg_res["active_version"] if cfg_res and cfg_res.get("active_version") else None
+
+            # Cypher Vector Query có điều kiện RBAC & Active Version ngay tại DB
             vector_rbac_cypher = """
             CALL db.index.vector.queryNodes('internal_chunk_vector_index', $fetch_k, $q_vec)
             YIELD node, score
             WHERE ($is_admin = true OR node.project_code IN $allowed_list)
               AND ($target_code IS NULL OR node.project_code = $target_code)
+              AND ($active_version IS NULL OR node.version = $active_version)
             RETURN node.chunk_id AS chunk_id,
                    node.source_table AS source_table,
                    node.source_id AS source_id,
@@ -764,15 +769,17 @@ def run_internal_extractive_pipeline(
                 "q_vec": q_vec,
                 "is_admin": is_admin,
                 "allowed_list": allowed_list,
-                "target_code": target_code
+                "target_code": target_code,
+                "active_version": active_version
             }).data()
 
-            # Cypher Fulltext Query có điều kiện RBAC ngay tại DB
+            # Cypher Fulltext Query có điều kiện RBAC & Active Version ngay tại DB
             fulltext_rbac_cypher = """
             CALL db.index.fulltext.queryNodes('internal_chunk_fulltext_index', $ft_query)
             YIELD node, score
             WHERE ($is_admin = true OR node.project_code IN $allowed_list)
               AND ($target_code IS NULL OR node.project_code = $target_code)
+              AND ($active_version IS NULL OR node.version = $active_version)
             RETURN node.chunk_id AS chunk_id,
                    node.source_table AS source_table,
                    node.source_id AS source_id,
@@ -789,7 +796,8 @@ def run_internal_extractive_pipeline(
                     "fetch_k": fetch_k,
                     "is_admin": is_admin,
                     "allowed_list": allowed_list,
-                    "target_code": target_code
+                    "target_code": target_code,
+                    "active_version": active_version
                 }).data()
             except Exception as fte:
                 logger.warning(f"Lỗi truy vấn fulltext index: {fte}")

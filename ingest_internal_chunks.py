@@ -4,6 +4,7 @@ import csv
 import logging
 import time
 import json
+from datetime import datetime
 from pathlib import Path
 from neo4j import GraphDatabase
 from transformers import AutoTokenizer
@@ -22,7 +23,6 @@ NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "graphrag_password123")
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
-# Giới hạn an toàn token cho tokenizer của all-MiniLM-L6-v2 (model max: 256 / tokenizer max 512)
 MAX_TOKENS_PER_CHUNK = 220
 TOKEN_OVERLAP = 40
 
@@ -36,10 +36,6 @@ def read_sanitized_csv(file_name: str):
         return list(reader)
 
 def clean_and_extract_threads(notes: str):
-    """
-    Tách bỏ chuỗi raw json [THREAD:[...]] và chỉ trích xuất các trao đổi công việc thực sự.
-    Loại bỏ các tin nhắn ngắn rác/vô nghĩa (ví dụ: 'đúng', 'dạ anh', '').
-    """
     if not notes:
         return ""
     idx = notes.find("[THREAD:")
@@ -49,7 +45,6 @@ def clean_and_extract_threads(notes: str):
     prefix = notes[:idx].strip()
     rest = notes[idx + len("[THREAD:"):].strip()
     
-    # Bỏ tag [tech-status:...] nếu có
     if "[tech-status:" in rest:
         rest = rest[:rest.find("[tech-status:")].strip()
     if rest.endswith("]"):
@@ -60,7 +55,6 @@ def clean_and_extract_threads(notes: str):
         messages = json.loads(rest)
         for m in messages:
             content = (m.get("content") or "").strip()
-            # Bỏ qua tin rác không mang ngữ nghĩa công việc
             if not content or content.lower() in ["đúng", "dạ", "dạ anh", "dạ vâng", "ok", "done"]:
                 continue
             role = m.get("senderRole") or "Nhân sự"
@@ -76,10 +70,6 @@ def clean_and_extract_threads(notes: str):
     return "\n".join(parts).strip()
 
 def split_text_by_tokenizer(text: str, tokenizer, max_tokens: int = MAX_TOKENS_PER_CHUNK, overlap: int = TOKEN_OVERLAP):
-    """
-    Chia nhỏ text dựa trên tokenizer thực tế của mô hình embedding.
-    Nếu vượt quá max_tokens, tạo sliding window với overlap để bảo toàn ngữ cảnh.
-    """
     token_ids = tokenizer.encode(text, add_special_tokens=False)
     if len(token_ids) <= max_tokens:
         return [text]
@@ -96,15 +86,17 @@ def split_text_by_tokenizer(text: str, tokenizer, max_tokens: int = MAX_TOKENS_P
     return chunks
 
 def init_internal_indexes(session):
-    """
-    Khai báo constraint và Vector/Fulltext Index chuyên biệt cho InternalChunk.
-    Đợi index đạt trạng thái ONLINE theo đúng tài liệu Neo4j.
-    """
-    logger.info("🔧 Đang khởi tạo Constraint & Index cho InternalChunk trên Neo4j...")
+    logger.info("🔧 Đang kiểm tra Constraint & Index cho InternalChunk trên Neo4j...")
     
+    # 1. Unique constraint trên chunk_id và version
     session.run("""
         CREATE CONSTRAINT internal_chunk_id_unique IF NOT EXISTS
         FOR (c:InternalChunk) REQUIRE c.chunk_id IS UNIQUE
+    """)
+
+    session.run("""
+        CREATE CONSTRAINT system_config_id_unique IF NOT EXISTS
+        FOR (s:SystemConfig) REQUIRE s.id IS UNIQUE
     """)
 
     session.run("""
@@ -131,7 +123,7 @@ def init_internal_indexes(session):
             break
         time.sleep(1)
 
-def extract_chunks_from_field_logs(rows, tokenizer):
+def extract_chunks_from_field_logs(rows, tokenizer, version_tag: str):
     chunks = []
     for r in rows:
         fid = r.get("id") or ""
@@ -154,17 +146,18 @@ def extract_chunks_from_field_logs(rows, tokenizer):
         split_texts = split_text_by_tokenizer(full_text, tokenizer)
         for idx, t in enumerate(split_texts):
             chunks.append({
-                "chunk_id": f"field_logs_{fid}_{idx}",
+                "chunk_id": f"field_logs_{fid}_{idx}_{version_tag}",
                 "source_table": "field_logs",
                 "source_id": fid,
                 "project_code": p_code,
                 "date": date,
                 "created_by": created_by,
-                "text": t
+                "text": t,
+                "version": version_tag
             })
     return chunks
 
-def extract_chunks_from_tasks(rows, tokenizer):
+def extract_chunks_from_tasks(rows, tokenizer, version_tag: str):
     chunks = []
     for r in rows:
         tid = r.get("id") or ""
@@ -182,17 +175,18 @@ def extract_chunks_from_tasks(rows, tokenizer):
         split_texts = split_text_by_tokenizer(full_text, tokenizer)
         for idx, t in enumerate(split_texts):
             chunks.append({
-                "chunk_id": f"tasks_{tid}_{idx}",
+                "chunk_id": f"tasks_{tid}_{idx}_{version_tag}",
                 "source_table": "tasks",
                 "source_id": tid,
                 "project_code": p_code,
                 "date": date[:10] if date else "",
                 "created_by": "",
-                "text": t
+                "text": t,
+                "version": version_tag
             })
     return chunks
 
-def extract_chunks_from_material_plans(rows, tokenizer):
+def extract_chunks_from_material_plans(rows, tokenizer, version_tag: str):
     chunks = []
     for r in rows:
         mid = r.get("id") or ""
@@ -219,13 +213,14 @@ def extract_chunks_from_material_plans(rows, tokenizer):
         split_texts = split_text_by_tokenizer(full_text, tokenizer)
         for idx, t in enumerate(split_texts):
             chunks.append({
-                "chunk_id": f"material_plans_{mid}_{idx}",
+                "chunk_id": f"material_plans_{mid}_{idx}_{version_tag}",
                 "source_table": "material_plans",
                 "source_id": mid,
                 "project_code": p_code,
                 "date": date[:10] if date else "",
                 "created_by": "",
-                "text": t
+                "text": t,
+                "version": version_tag
             })
     return chunks
 
@@ -234,11 +229,12 @@ def chunk_list(lst, size=200):
         yield lst[i:i + size]
 
 def main():
+    version_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger.info("===============================================================")
-    logger.info("🚀 BẮT ĐẦU EXTRACTIVE RAG INGESTION DỮ LIỆU NỘI BỘ (TOKENIZER CHUNKING)")
+    logger.info(f"🚀 BẮT ĐẦU VERSIONED INGESTION CHO DỮ LIỆU NỘI BỘ (VERSION: {version_tag})")
     logger.info("===============================================================")
 
-    # 1. Khởi tạo tokenizer của mô hình embedding
+    # 1. Khởi tạo tokenizer & embedder
     logger.info(f"🧠 Đang nạp Tokenizer & Mô hình '{EMBEDDING_MODEL_NAME}'...")
     tokenizer = AutoTokenizer.from_pretrained(f"sentence-transformers/{EMBEDDING_MODEL_NAME}")
     embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
@@ -249,20 +245,21 @@ def main():
     mat_plans_rows = read_sanitized_csv("material_plans.csv")
 
     chunks = []
-    chunks.extend(extract_chunks_from_field_logs(field_logs_rows, tokenizer))
-    chunks.extend(extract_chunks_from_tasks(tasks_rows, tokenizer))
-    chunks.extend(extract_chunks_from_material_plans(mat_plans_rows, tokenizer))
+    chunks.extend(extract_chunks_from_field_logs(field_logs_rows, tokenizer, version_tag))
+    chunks.extend(extract_chunks_from_tasks(tasks_rows, tokenizer, version_tag))
+    chunks.extend(extract_chunks_from_material_plans(mat_plans_rows, tokenizer, version_tag))
 
-    logger.info(f"📄 Đã trích xuất tổng cộng {len(chunks)} Internal Chunks (sau khi làm sạch THREAD & tokenize chunking):")
+    expected_count = len(chunks)
+    logger.info(f"📄 Đã trích xuất tổng cộng {expected_count} Internal Chunks cho phiên bản {version_tag}:")
     logger.info(f"   - field_logs: {len([c for c in chunks if c['source_table'] == 'field_logs'])}")
     logger.info(f"   - tasks: {len([c for c in chunks if c['source_table'] == 'tasks'])}")
     logger.info(f"   - material_plans: {len([c for c in chunks if c['source_table'] == 'material_plans'])}")
 
-    if not chunks:
-        logger.warning("Không có chunk nào được trích xuất.")
+    if expected_count == 0:
+        logger.error("Không có chunk nào được trích xuất. Hủy bỏ nạp.")
         return
 
-    # 3. Tính toán Vector Embedding cho các chunks
+    # 3. Tính toán Vector Embedding cho phiên bản mới
     texts_to_embed = [c["text"] for c in chunks]
     logger.info(f"⚡ Đang tính toán Vector Embedding cho {len(texts_to_embed)} chunks...")
     embeddings = embedder.encode(texts_to_embed, batch_size=64, show_progress_bar=True).tolist()
@@ -270,16 +267,12 @@ def main():
     for i, emb in enumerate(embeddings):
         chunks[i]["embedding"] = emb
 
-    # 4. Dọn dẹp các node InternalChunk cũ và nạp lại bằng MERGE (Idempotent)
+    # 4. Nạp Staging vào Neo4j (KHÔNG XÓA DỮ LIỆU CŨ KHI NẠP)
     driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
     with driver.session() as session:
         init_internal_indexes(session)
 
-        # Xóa các InternalChunk cũ để đồng bộ ID mới theo chunk_index chuẩn xác
-        logger.info("🧹 Đang dọn dẹp các node InternalChunk cũ trên Neo4j...")
-        session.run("MATCH (c:InternalChunk) DETACH DELETE c")
-
-        logger.info("📥 Đang lưu các InternalChunk chuẩn hóa vào Neo4j...")
+        logger.info(f"📥 Đang nạp {expected_count} chunks vào vùng Staging (version: {version_tag})...")
         ingest_cypher = """
         UNWIND $batch AS row
         MERGE (c:InternalChunk {chunk_id: row.chunk_id})
@@ -289,7 +282,8 @@ def main():
             c.date = row.date,
             c.created_by = row.created_by,
             c.text = row.text,
-            c.embedding = row.embedding
+            c.embedding = row.embedding,
+            c.version = row.version
         WITH c, row
         WHERE row.project_code IS NOT NULL AND row.project_code <> ''
         MATCH (p:Project {code: row.project_code})
@@ -299,15 +293,52 @@ def main():
         for batch in chunk_list(chunks, 200):
             session.run(ingest_cypher, batch=batch)
 
-        # Thống kê sau nạp
-        cnt = session.run("MATCH (c:InternalChunk) RETURN count(c) AS count").single()["count"]
-        rel_cnt = session.run("MATCH ()-[r:HAS_INTERNAL_CHUNK]->() RETURN count(r) AS count").single()["count"]
-        logger.info(f"✅ Tổng số Node InternalChunk trên Neo4j: {cnt}")
-        logger.info(f"🔗 Tổng số quan hệ [:HAS_INTERNAL_CHUNK] nối với Project: {rel_cnt}")
+        # 5. XÁC MINH TÍNH TOÀN VẸN TRƯỚC KHI CHUYỂN ACTIVE POINTER
+        logger.info("🔍 Đang xác minh tính toàn vẹn số lượng chunk của phiên bản mới...")
+        verify_query = """
+        MATCH (c:InternalChunk {version: $version})
+        RETURN count(c) AS loaded_count
+        """
+        loaded_count = session.run(verify_query, version=version_tag).single()["loaded_count"]
+        logger.info(f"   -> Kết quả: Đã nạp thành công {loaded_count}/{expected_count} chunks.")
+
+        if loaded_count != expected_count:
+            logger.error(f"❌ THẤT BẠI: Số lượng chunks nạp ({loaded_count}) không khớp dự kiến ({expected_count}). "
+                         f"HỦY BỎ CHUYỂN ACTIVE POINTER. Phiên bản cũ vẫn đang hoạt động an toàn.")
+            driver.close()
+            return
+
+        # 6. ATOMIC SWAP ACTIVE POINTER TRONG MỘT TRANSACTION
+        logger.info("🔄 Đang thực hiện Atomic Pointer Swap chuyển active_version...")
+        swap_query = """
+        MERGE (s:SystemConfig {id: 'internal_rag_state'})
+        SET s.previous_version = coalesce(s.active_version, 'none'),
+            s.active_version = $version,
+            s.updated_at = $updated_at,
+            s.total_chunks = $total_chunks
+        RETURN s.active_version AS active_version, s.previous_version AS previous_version
+        """
+        res = session.run(
+            swap_query, 
+            version=version_tag, 
+            updated_at=datetime.now().isoformat(),
+            total_chunks=loaded_count
+        ).single()
+        logger.info(f"✅ ĐÃ CHUYỂN ACTIVE POINTER THÀNH CÔNG: active_version = '{res['active_version']}' (cũ: '{res['previous_version']}')")
+
+        # 7. DỌN DẸP PHIÊN BẢN CŨ TIẾN TRÌNH NỀN
+        prev_ver = res["previous_version"]
+        if prev_ver and prev_ver != "none" and prev_ver != version_tag:
+            logger.info(f"🧹 Đang dọn dẹp các node thuộc phiên bản cũ ({prev_ver})...")
+            session.run("MATCH (c:InternalChunk {version: $old_ver}) DETACH DELETE c", old_ver=prev_ver)
+            logger.info(f"✅ Đã dọn dẹp xong phiên bản cũ {prev_ver}.")
+        else:
+            # Dọn dẹp các chunk không có version (từ phiên bản nạp ban đầu)
+            session.run("MATCH (c:InternalChunk) WHERE c.version IS NULL DETACH DELETE c")
 
     driver.close()
     logger.info("===============================================================")
-    logger.info("🎉 HOÀN THÀNH INGESTION EXTRACTIVE RAG CHO DỮ LIỆU NỘI BỘ!")
+    logger.info(f"🎉 HOÀN THÀNH ATOMIC ACTIVE POINTER INGESTION (VERSION: {version_tag})!")
     logger.info("===============================================================")
 
 if __name__ == "__main__":
