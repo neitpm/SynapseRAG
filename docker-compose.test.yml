@@ -1,14 +1,14 @@
-name: graphrag-chaos-test
+name: ${COMPOSE_PROJECT_NAME:-graphrag-chaos-test}
 
 networks:
   chaos_isolated_net:
     driver: bridge
-    name: graphrag-chaos-test-net
+    name: ${CHAOS_NET_NAME:-graphrag-chaos-test-net}
 
 services:
   neo4j-chaos-test:
     image: neo4j:5.20-community
-    container_name: graphrag-neo4j-chaos-test
+    container_name: ${CHAOS_CONTAINER_NAME:-graphrag-neo4j-chaos-test}
     networks:
       - chaos_isolated_net
     ports:
