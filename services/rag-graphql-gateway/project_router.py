@@ -50,20 +50,35 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
     q_lower = question.lower()
 
     # -------------------------------------------------------------------------
-    # INTENT 0: Thống kê số lượng / Danh sách dự án trong hệ thống (Hỗ trợ lọc theo cấp điện áp hoặc từ khóa)
+    # INTENT 0: Thống kê số lượng / Danh sách dự án trong hệ thống
+    # CHỈ kích hoạt khi câu hỏi THỰC SỰ là hỏi số lượng hoặc danh sách dự án
     # -------------------------------------------------------------------------
-    if any(k in q_lower for k in [
+    is_project_listing = any(k in q_lower for k in [
         "bao nhiêu dự án", "số lượng dự án", "danh sách dự án", "có những dự án nào",
-        "liệt kê dự án", "dự án nào", "tổng số dự án"
-    ]) and not any(k in q_lower for k in ["chi phí", "tiến độ", "vật tư", "nhật trình"]):
-        # Trích xuất bộ lọc (ví dụ: 110kv, 220kv, 500kv, trạm biến áp, đường dây,...)
+        "liệt kê dự án", "tổng số dự án"
+    ])
+    if is_project_listing and not any(k in q_lower for k in ["chi phí", "tiến độ", "vật tư", "nhật trình", "hồ sơ", "chưa ký", "sự cố"]):
+        # Trích xuất bộ lọc động (Dynamic regex / entity extraction)
+        # 1. Trích xuất cấp điện áp bất kỳ (ví dụ: 10kv, 22kv, 35kv, 110kv, 220kv, 500kv,...)
+        voltage_match = re.search(r"\b(\d+\s*kv)\b", q_lower)
         filter_keyword = None
         filter_label = None
-        for kw in ["110kv", "220kv", "500kv", "trạm biến áp", "đường dây", "thuỷ điện", "thủy điện"]:
-            if kw in q_lower:
-                filter_keyword = kw
-                filter_label = kw.upper() if "kv" in kw else kw.title()
-                break
+
+        if voltage_match:
+            raw_v = voltage_match.group(1).replace(" ", "")
+            filter_keyword = raw_v
+            filter_label = raw_v.upper()
+        else:
+            # 2. Trích xuất loại hình hoặc từ khóa cụm danh từ sau "dự án"
+            # Ví dụ: "dự án trạm biến áp", "dự án đường dây", "dự án thủy điện", v.v.
+            after_match = re.search(r"dự án\s+([\w\s]+)", q_lower)
+            if after_match:
+                extracted = after_match.group(1).strip()
+                # Loại trừ các từ để hỏi hoặc số lượng thông thường
+                cleaned = re.sub(r"^(nào|gì|đang có|này|kia|ở|tại)\s*", "", extracted).strip()
+                if len(cleaned) >= 3 and cleaned not in ["nào", "gì", "này", "kia"]:
+                    filter_keyword = cleaned
+                    filter_label = cleaned.title()
 
         if not auth_user.is_admin:
             # Nếu là user thường: Chỉ hiển thị các dự án user được phân quyền (có áp dụng filter nếu có)
@@ -75,11 +90,18 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                     "formatted_answer": f"Tài khoản của bạn (`{auth_user.user_id}`) hiện chưa được phân quyền truy cập dự án nào trong hệ thống."
                 }
             if filter_keyword:
-                cypher = """
-                MATCH (p:Project)
-                WHERE p.code IN $allowed AND (toLower(p.name) CONTAINS $filter OR toLower(p.code) CONTAINS $filter)
-                RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
-                """
+                if filter_keyword.endswith("kv"):
+                    cypher = """
+                    MATCH (p:Project)
+                    WHERE p.code IN $allowed AND (p.name =~ ('(?i).*\\\\b' + $filter + '\\\\b.*') OR p.code =~ ('(?i).*\\\\b' + $filter + '\\\\b.*'))
+                    RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
+                    """
+                else:
+                    cypher = """
+                    MATCH (p:Project)
+                    WHERE p.code IN $allowed AND (toLower(p.name) CONTAINS $filter OR toLower(p.code) CONTAINS $filter)
+                    RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
+                    """
                 params = {"allowed": allowed, "filter": filter_keyword}
             else:
                 cypher = """
@@ -113,11 +135,19 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
         else:
             # Nếu là Admin: Hiển thị toàn bộ hoặc lọc theo điều kiện
             if filter_keyword:
-                cypher = """
-                MATCH (p:Project)
-                WHERE toLower(p.name) CONTAINS $filter OR toLower(p.code) CONTAINS $filter
-                RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
-                """
+                # Nếu là cấp điện áp (kết thúc bằng 'kv'): so khớp theo từ ranh giới regex trong Cypher để 10kv không nuốt nhầm 110kv
+                if filter_keyword.endswith("kv"):
+                    cypher = """
+                    MATCH (p:Project)
+                    WHERE p.name =~ ('(?i).*\\\\b' + $filter + '\\\\b.*') OR p.code =~ ('(?i).*\\\\b' + $filter + '\\\\b.*')
+                    RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
+                    """
+                else:
+                    cypher = """
+                    MATCH (p:Project)
+                    WHERE toLower(p.name) CONTAINS $filter OR toLower(p.code) CONTAINS $filter
+                    RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
+                    """
                 params = {"filter": filter_keyword}
             else:
                 cypher = """
