@@ -1236,12 +1236,24 @@ async def stream_rag_debug(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.get("/metrics")
-def metrics_endpoint():
+def metrics_endpoint(
+    x_metrics_token: Optional[str] = Header(None, alias="X-Metrics-Token")
+):
     """
     Prometheus Scrape Endpoint:
+    Được bảo vệ bằng Secret Header X-Metrics-Token (riêng biệt, không tái sử dụng JWT).
+    Trả HTTP 403 Forbidden nếu thiếu hoặc sai token.
     Đồng bộ thông số ingestion từ SystemConfig Neo4j trước khi xuất metrics.
     Cập nhật rag_ingestion_metrics_source_up (1=OK, 0=Fail) và reset label version cũ.
     """
+    configured_token = settings.METRICS_SCRAPE_TOKEN
+    if configured_token:
+        if not x_metrics_token or x_metrics_token.strip() != configured_token:
+            raise HTTPException(
+                status_code=403,
+                detail="403 Forbidden: Yêu cầu X-Metrics-Token hợp lệ để scrape metrics nội bộ."
+            )
+
     try:
         with neo4j_driver.session() as session:
             cfg = session.run("""

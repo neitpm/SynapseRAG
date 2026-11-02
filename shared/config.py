@@ -32,4 +32,7 @@ class BaseSettings:
     # Debug Trace
     RAG_DEBUG_TRACE_ENABLED: bool = os.getenv("RAG_DEBUG_TRACE_ENABLED", "true").lower() in ("true", "1", "yes")
 
+    # Observability & Metrics Protection
+    METRICS_SCRAPE_TOKEN: str = os.getenv("METRICS_SCRAPE_TOKEN", "").strip()
+
 settings = BaseSettings()
