@@ -69,7 +69,14 @@ def ingest_projects(session):
         p.start_date = row.start_date,
         p.end_date = row.end_date,
         p.notes = row.notes,
-        p.created_at = row.created_at
+        p.created_at = row.created_at,
+        p.project_type = CASE
+            WHEN row.code IN ['CHI_PHI_VAN_PHONG'] THEN 'OPERATIONAL'
+            WHEN row.code IN ['COMPANY'] THEN 'WAREHOUSE'
+            WHEN row.code IN ['PHAN_MEM_CONG_TY'] THEN 'INTERNAL_SOFTWARE'
+            WHEN toLower(row.notes) CONTAINS 'thương mại' OR toLower(row.name) CONTAINS 'cung cấp máy tính' OR toLower(row.name) CONTAINS 'hđ 26 màn' THEN 'COMMERCIAL'
+            ELSE 'CONSTRUCTION'
+        END
     """
     for batch in chunk_list(rows, 500):
         session.run(query, batch=batch)
