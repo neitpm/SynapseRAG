@@ -1139,7 +1139,9 @@ async def get_context(request: Request) -> Dict[str, Any]:
     if request.method == "GET" and "text/html" in accept_header:
         return {"request": request, "auth_user": None}
 
-    auth_header = request.headers.get("Authorization")
+    auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+    logger.info(f"🔑 [get_context] Auth header received: {bool(auth_header)} (len: {len(auth_header) if auth_header else 0})")
+
     if not auth_header:
         AUTH_REQUESTS_TOTAL.labels(status="missing_token").inc()
         raise HTTPException(
@@ -1150,9 +1152,11 @@ async def get_context(request: Request) -> Dict[str, Any]:
         auth_user = verify_access_token(auth_header)
         AUTH_REQUESTS_TOTAL.labels(status="success").inc()
     except PermissionError as pe:
+        logger.warning(f"⛔ [get_context] verify_access_token PermissionError: {pe}")
         AUTH_REQUESTS_TOTAL.labels(status="forbidden").inc()
         raise HTTPException(status_code=401, detail=str(pe))
     except Exception as e:
+        logger.warning(f"⚠️ [get_context] verify_access_token Error: {e}")
         AUTH_REQUESTS_TOTAL.labels(status="invalid_token").inc()
         raise HTTPException(status_code=401, detail=f"401 Unauthorized: Token không hợp lệ ({str(e)})")
 

@@ -112,7 +112,7 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                 }
 
             cypher = """
-            MATCH (p:Project {code: $code})-[:HAS_EXPENSE]->(e:Expense)
+            MATCH (p:Project {code: $code})-[:INCURRED_EXPENSE]->(e:Expense)
             RETURN p.name AS project_name,
                    p.code AS project_code,
                    count(e) AS expense_records,
@@ -143,6 +143,56 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                     "formatted_answer": f"Dự án **{p_name} ({p_code})** hiện chưa phát sinh chứng từ chi phí thực tế trong hệ thống hạch toán."
                 }
         else:
+            # Kiểm tra intent Xếp hạng Top dự án chi phí cao nhất (Top Expense Ranking)
+            is_top_ranking_query = any(k in q_lower for k in [
+                "nhiều nhất", "lớn nhất", "cao nhất", "tốn nhất", "top", "xếp hạng", 
+                "chiếm chi phí nhiều nhất", "chiếm nhiều nhất"
+            ])
+            if is_top_ranking_query:
+                # Bắt buộc chỉ Admin mới có quyền xem xếp hạng đa dự án
+                if not auth_user.is_admin:
+                    return {
+                        "intent": "PERMISSION_DENIED",
+                        "cypher_duration_ms": 0.0,
+                        "formatted_answer": (
+                            "⛔ **Truy cập bị từ chối (403 Forbidden):**\n"
+                            "Yêu cầu xếp hạng và so sánh chi phí đa dự án đòi hỏi quyền Quản trị viên (Admin).\n"
+                            f"Tài khoản hiện tại (`{auth_user.user_id}`) chỉ có quyền truy cập trong phạm vi dự án được phân công."
+                        )
+                    }
+
+                cypher = """
+                MATCH (p:Project)-[:INCURRED_EXPENSE]->(e:Expense)
+                WITH p, count(e) AS expense_count, sum(coalesce(e.total_amount, 0.0)) AS total_cost
+                ORDER BY total_cost DESC
+                LIMIT 5
+                RETURN p.name AS project_name,
+                       p.code AS project_code,
+                       expense_count,
+                       total_cost
+                """
+                c_start = time.perf_counter()
+                with driver.session() as session:
+                    records = list(session.run(cypher))
+                c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+                if records:
+                    ranking_lines = []
+                    for idx, r in enumerate(records, start=1):
+                        cost_str = f"{r['total_cost']:,.0f} VNĐ"
+                        ranking_lines.append(f"{idx}. **{r['project_name']}** (`{r['project_code']}`): **{cost_str}** ({r['expense_count']} phiếu chi)")
+                    
+                    answer_text = (
+                        "🏆 **BẢNG XẾP HẠNG TOP DỰ ÁN CÓ CHI PHÍ CAO NHẤT:**\n\n"
+                        + "\n".join(ranking_lines) +
+                        "\n\n*(Dữ liệu tổng hợp từ toàn bộ chứng từ thực chi `INCURRED_EXPENSE` trong hệ thống)*"
+                    )
+                    return {
+                        "intent": "TOP_EXPENSE_PROJECTS_RANKING",
+                        "cypher_duration_ms": c_dur,
+                        "formatted_answer": answer_text
+                    }
+
             # Câu hỏi toàn công ty: Chỉ Admin mới được quyền xem tổng kinh phí toàn công ty
             if any(k in q_lower for k in ["toàn công ty", "tất cả dự án", "toàn bộ dự án", "tổng công ty"]):
                 if not auth_user.is_admin:
