@@ -219,3 +219,76 @@ query {
   }
 }
 ```
+
+
+---
+
+## 🛡️ Quy trình Tiền xử lý Dữ liệu Nội bộ (Enterprise Data Preprocessing & Sanitization)
+
+Trên nhánh phát triển **`feat/internal-project-copilot`**, hệ thống hỗ trợ nạp và phân tích dữ liệu quản trị dự án xây lắp (trạm biến áp, đường dây, nhân sự, vật tư, chi phí). Để bảo vệ dữ liệu và đảm bảo độ chính xác của Graph Analytics, quy trình tiền xử lý được chuẩn hóa qua các bước nghiêm ngặt:
+
+```
+[ Raw Supabase Datasets ] (datasets/)
+           │
+           ▼
+┌────────────────────────────────────────────────────────┐
+│  Bước 1: Streaming RFC 4180 Multiline Parser           │  profile_and_sanitize.mjs
+│  - Hỗ trợ ô chứa ký tự xuống dòng (\n) trong ngoặc kép │
+│  - Cách ly hàng lỗi lệch cột (_malformed_records/)     │
+└──────────┬─────────────────────────────────────────────┘
+           │
+           ▼
+┌────────────────────────────────────────────────────────┐
+│  Bước 2: Data Sanitization (Khử dữ liệu nhạy cảm)      │  datasets_sanitized/
+│  - Xóa bỏ mật khẩu: `engineers.password`               │
+│  - Xóa bỏ liên hệ cá nhân bên ngoài: phone, address    │
+│  - Cách ly 100% bảng tin nhắn riêng: `direct_messages` │
+│  - Lọc bỏ 4 bảng rỗng (0 rows): issues, payrolls,...   │
+└──────────┬─────────────────────────────────────────────┘
+           │
+           ▼
+┌────────────────────────────────────────────────────────┐
+│  Bước 3: Type Casting & Orphan FK Preservation         │  ingest_knowledge_graph.py
+│  - Ép kiểu số: `total_amount`, `progress` sang số thực │
+│  - Giữ lại ID khóa ngoại mồ côi (không đoán mò)        │
+│  - Lọc bỏ `is_section_header = true` khỏi tiến độ      │
+└──────────┬─────────────────────────────────────────────┘
+           │
+           ▼
+┌────────────────────────────────────────────────────────┐
+│  Bước 4: Nạp Enterprise Knowledge Graph vào Neo4j      │
+│  - Tạo 7 nhãn Node: Project, Task, MaterialPlan,       │
+│    PurchasingPlan, Expense, Material, FieldLog, Eng.   │
+│  - Thiết lập 11 loại liên kết quan hệ nghiệp vụ        │
+└──────────┬─────────────────────────────────────────────┘
+           │
+           ▼
+┌────────────────────────────────────────────────────────┐
+│  Bước 5: Parameterized Cypher Query Router             │  project_router.py
+│  - Định tuyến câu hỏi thống kê tiến độ, chi phí        │
+│  - Tuyệt đối không để LLM tự sinh Cypher tùy ý         │
+│  - Tắt Wikipedia crawl đối với thực thể nội bộ         │
+└────────────────────────────────────────────────────────┘
+```
+
+### 1. Chuẩn hóa phân tích cú pháp (RFC 4180 CSV Parsing)
+- **Vấn đề thực tế:** Các trường ghi chú (`notes`), mô tả công việc (`job_content`), nhật trình thi công (`field_logs`) chứa ký tự xuống dòng (`\n`) nằm bên trong ô. Việc đọc từng dòng vật lý thông thường (`readline`) sẽ chẻ 1 bản ghi thành nhiều dòng rác làm sai lệch thống kê.
+- **Giải pháp:** Sử dụng thư viện `csv-parse` theo chuẩn RFC 4180 với cơ chế streaming (`profile_and_sanitize.mjs`):
+  - Giữ nguyên vẹn 1.000 Tasks, 2.788 Kế hoạch vật tư, 1.146 Đơn mua sắm, 928 Phiếu chi.
+  - Tỷ lệ khớp khóa ngoại `tasks.project_code` -> `projects.code` đạt **100.0%**.
+
+### 2. Khử dữ liệu nhạy cảm & Bảo vệ riêng tư (Sanitization)
+Toàn bộ dữ liệu sạch được lưu độc lập tại thư mục `datasets_sanitized/` (đã đưa vào `.gitignore`):
+- **Bảo vệ danh tính:** Loại bỏ hoàn toàn `password`, `phone`, `email` trong `engineers.csv`.
+- **Cách ly tin nhắn:** Loại bỏ hoàn toàn bảng `direct_messages` khỏi pipeline nạp đồ thị công khai.
+- **Báo cáo an toàn:** File tổng kết `_data_profiling_and_cleaning_report.json` không ghi log bất kỳ chuỗi văn bản mẫu nào chứa thông tin riêng tư.
+
+### 3. Xử lý khóa ngoại mồ côi (Orphan Foreign Keys)
+- Dữ liệu thực tế ghi nhận 8 task trỏ tới 2 ID kỹ sư cũ và 4 đơn mua sắm trỏ tới 4 ID kế hoạch vật tư cũ.
+- **Nguyên tắc nạp:** Giữ nguyên vẹn giá trị ID gốc trên thuộc tính của Node để phục vụ kiểm toán (audit trail), **không tự suy đoán hay thay thế bằng kỹ sư khác**, chỉ tạo quan hệ `[:ASSIGNED_TO]` khi Node mục tiêu thực sự tồn tại.
+
+### 4. Quy tắc tính toán & Bộ định tuyến truy vấn (Query Router)
+- **Tiến độ dự án:** Vì cột `projects.progress_percent` gốc là `0`, hệ thống tính tiến độ trung bình thực tế từ các task con:
+  $$\text{Tiến độ trung bình} = \frac{1}{N} \sum_{i=1}^{N} (\text{task.progress}_i \times 100) \quad \text{với } \text{is\_section\_header} = \text{false}$$
+- **Chi phí hạch toán:** Sử dụng trường `total_amount` (thay vì `amount`) để tổng hợp số tiền thực chi trên 928 phiếu chi (`sum(e.total_amount)` = 399.209.368 VNĐ).
+- **Bảo mật mô hình:** Tắt toàn bộ luồng cào Wikipedia tự động đối với các thực thể dự án nội bộ để ngăn chặn rò rỉ tên công trình ra ngoài internet.
