@@ -70,6 +70,11 @@ RAG_ACTIVE_VERSION_INFO = Gauge(
     ["version"]
 )
 
+RAG_INGESTION_METRICS_SOURCE_UP = Gauge(
+    "rag_ingestion_metrics_source_up",
+    "Trạng thái kết nối và đọc telemetry ingestion từ CSDL Neo4j (1=thành công, 0=thất bại)"
+)
+
 INGESTION_LOCK_TAKEOVERS_COUNT = Gauge(
     "rag_ingestion_lock_takeovers_count",
     "Tổng số lần Ingestion Lock bị takeover do timeout/lease recovery (đọc từ SystemConfig)"
@@ -1235,6 +1240,7 @@ def metrics_endpoint():
     """
     Prometheus Scrape Endpoint:
     Đồng bộ thông số ingestion từ SystemConfig Neo4j trước khi xuất metrics.
+    Cập nhật rag_ingestion_metrics_source_up (1=OK, 0=Fail) và reset label version cũ.
     """
     try:
         with neo4j_driver.session() as session:
@@ -1249,16 +1255,22 @@ def metrics_endpoint():
                        coalesce(s.total_chunks, 0) AS total_chunks
             """).single()
             if cfg:
-                if cfg.get("active_version"):
-                    RAG_ACTIVE_VERSION_INFO.labels(version=cfg["active_version"]).set(1)
+                active_ver = cfg.get("active_version")
+                if active_ver:
+                    RAG_ACTIVE_VERSION_INFO.clear()
+                    RAG_ACTIVE_VERSION_INFO.labels(version=active_ver).set(1)
                 INGESTION_LOCK_TAKEOVERS_COUNT.set(cfg["total_lock_takeovers"])
                 INGESTION_ROLLBACKS_COUNT.set(cfg["total_rollbacks"])
                 INGESTION_LAST_DURATION_SECONDS.set(cfg["last_ingestion_duration_sec"])
                 INGESTION_LAST_EMBED_DURATION_SECONDS.set(cfg["last_embedding_duration_sec"])
                 INGESTION_LAST_SMOKE_DURATION_SECONDS.set(cfg["last_smoke_duration_sec"])
                 INGESTION_LAST_TOTAL_CHUNKS.set(cfg["total_chunks"])
+                RAG_INGESTION_METRICS_SOURCE_UP.set(1)
+            else:
+                RAG_INGESTION_METRICS_SOURCE_UP.set(0)
     except Exception as e:
         logger.warning(f"Không thể sync ingestion metrics từ Neo4j: {e}")
+        RAG_INGESTION_METRICS_SOURCE_UP.set(0)
 
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
