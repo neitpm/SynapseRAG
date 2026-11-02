@@ -70,14 +70,14 @@ RAG_ACTIVE_VERSION_INFO = Gauge(
     ["version"]
 )
 
-INGESTION_LOCK_TAKEOVERS_TOTAL = Gauge(
-    "rag_ingestion_lock_takeovers_total",
-    "Tổng số lần Ingestion Lock bị takeover do timeout/lease recovery"
+INGESTION_LOCK_TAKEOVERS_COUNT = Gauge(
+    "rag_ingestion_lock_takeovers_count",
+    "Tổng số lần Ingestion Lock bị takeover do timeout/lease recovery (đọc từ SystemConfig)"
 )
 
-INGESTION_ROLLBACKS_TOTAL = Gauge(
-    "rag_ingestion_rollbacks_total",
-    "Tổng số lần job nạp thất bại và thực hiện rollback staging"
+INGESTION_ROLLBACKS_COUNT = Gauge(
+    "rag_ingestion_rollbacks_count",
+    "Tổng số lần job nạp thất bại và thực hiện rollback staging (đọc từ SystemConfig)"
 )
 
 INGESTION_LAST_DURATION_SECONDS = Gauge(
@@ -1251,8 +1251,8 @@ def metrics_endpoint():
             if cfg:
                 if cfg.get("active_version"):
                     RAG_ACTIVE_VERSION_INFO.labels(version=cfg["active_version"]).set(1)
-                INGESTION_LOCK_TAKEOVERS_TOTAL.set(cfg["total_lock_takeovers"])
-                INGESTION_ROLLBACKS_TOTAL.set(cfg["total_rollbacks"])
+                INGESTION_LOCK_TAKEOVERS_COUNT.set(cfg["total_lock_takeovers"])
+                INGESTION_ROLLBACKS_COUNT.set(cfg["total_rollbacks"])
                 INGESTION_LAST_DURATION_SECONDS.set(cfg["last_ingestion_duration_sec"])
                 INGESTION_LAST_EMBED_DURATION_SECONDS.set(cfg["last_embedding_duration_sec"])
                 INGESTION_LAST_SMOKE_DURATION_SECONDS.set(cfg["last_smoke_duration_sec"])
