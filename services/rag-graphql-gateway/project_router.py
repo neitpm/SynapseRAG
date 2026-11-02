@@ -59,15 +59,16 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
     ])
     if is_project_listing and not any(k in q_lower for k in ["chi phí", "tiến độ", "vật tư", "nhật trình", "hồ sơ", "chưa ký", "sự cố"]):
         # Trích xuất bộ lọc động (Dynamic regex / entity extraction)
-        # 1. Trích xuất cấp điện áp bất kỳ (ví dụ: 10kv, 22kv, 35kv, 110kv, 220kv, 500kv,...)
-        voltage_match = re.search(r"\b(\d+\s*kv)\b", q_lower)
+        # 1. Trích xuất cấp điện áp bất kỳ (ví dụ: 10kv, 10 kv, 10-kv, 110kv, 110 kV, 110-kV, 220kv, 500kv,...)
+        voltage_match = re.search(r"\b(\d+)[\s\-]*kv\b", q_lower)
         filter_keyword = None
         filter_label = None
 
         if voltage_match:
-            raw_v = voltage_match.group(1).replace(" ", "")
+            val_num = voltage_match.group(1)
+            raw_v = f"{val_num}kv"
             filter_keyword = raw_v
-            filter_label = raw_v.upper()
+            filter_label = f"{val_num}kV"
         else:
             # 2. Trích xuất loại hình hoặc từ khóa cụm danh từ sau "dự án"
             # Ví dụ: "dự án trạm biến áp", "dự án đường dây", "dự án thủy điện", v.v.
