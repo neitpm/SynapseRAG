@@ -23,6 +23,16 @@ redpanda_data/
 *.swp
 *.swo
 
+# Datasets and internal data exports (specific directories only)
+datasets/
+datasets_sanitized/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
 # OS
 .DS_Store
 Thumbs.db
