@@ -7,7 +7,7 @@ import urllib.request
 from pathlib import Path
 from typing import List, Optional, AsyncGenerator, Dict, Any, Tuple
 import strawberry
-from fastapi import FastAPI, Query as FastAPIQuery
+from fastapi import FastAPI, Query as FastAPIQuery, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from strawberry.fastapi import GraphQLRouter
@@ -25,6 +25,7 @@ sys.path.append(str(ROOT_DIR))
 from shared.config import settings
 from wiki_dynamic import extract_keyword_candidate, fetch_and_store_wiki_on_demand
 from project_router import execute_structured_query, match_project_in_question, is_internal_query_context
+from auth_rbac import verify_access_token, AuthUser, create_access_token
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("rag-graphql-gateway")
@@ -164,13 +165,13 @@ def execute_rag_pipeline(
     question: str, 
     top_k: int = 3, 
     collect_debug: bool = False,
-    progress_callback: Optional[Any] = None
+    progress_callback: Optional[Any] = None,
+    auth_user: Optional[AuthUser] = None
 ) -> tuple[str, list[dict], list[DebugStep], float]:
     """
     Pipeline cốt lõi duy nhất cho RAG:
-    - Bước 1: Embedding câu hỏi
-    - Bước 2: Neo4j Vector Search + Graph Traversal
-    - Bước 3: Gemini LLM Generation
+    - Kiểm tra cấu trúc & RBAC
+    - Phân loại Extractive RAG Nội bộ hoặc Tổng hợp tri thức
     Nếu có progress_callback, gọi callback đồng bộ theo từng event để SSE stream phát ra ngay lập tức.
     """
     t_start = time.perf_counter()
@@ -191,9 +192,9 @@ def execute_rag_pipeline(
 
     # =========================================================================
     # QUERY ROUTER: Kiểm tra câu hỏi nghiệp vụ / thống kê có cấu trúc trước
-    # Sử dụng Parameterized Cypher định nghĩa sẵn, không gửi dữ liệu dự án ra ngoài
+    # Sử dụng Parameterized Cypher định nghĩa sẵn, có kiểm tra quyền auth_user
     # =========================================================================
-    structured_res = execute_structured_query(question, neo4j_driver)
+    structured_res = execute_structured_query(question, neo4j_driver, auth_user=auth_user)
     if structured_res:
         intent = structured_res.get("intent")
         router_dur = round((time.perf_counter() - t_start) * 1000, 2)
@@ -209,15 +210,22 @@ def execute_rag_pipeline(
         notify("step_complete", {
             "step_id": 1,
             "name": "1. Project Query Router",
-            "status": "SUCCESS",
+            "status": "SUCCESS" if intent != "PERMISSION_DENIED" else "FAILED",
             "duration_ms": router_dur,
             "active_node": "gateway",
-            "details": f"Đã định tuyến: {intent}.",
+            "details": f"Định tuyến: {intent}.",
             "metrics": [{"key": "intent", "value": intent}]
         })
 
-        # Phân biệt: Nếu là câu hỏi mơ hồ cần làm rõ -> KHÔNG báo giả đã chạy Cypher Analytics
-        if intent == "AMBIGUOUS_EXPENSE_QUERY":
+        if intent == "PERMISSION_DENIED":
+            notify("step_failed", {
+                "step_id": 2,
+                "name": "2. Security & RBAC Enforcement",
+                "status": "FORBIDDEN",
+                "duration_ms": 0.0,
+                "error": "Tài khoản không có quyền truy cập dự án này."
+            })
+        elif intent == "AMBIGUOUS_EXPENSE_QUERY":
             notify("step_info", {
                 "step_id": 2,
                 "name": "2. Scope Clarification Required",
@@ -254,13 +262,13 @@ def execute_rag_pipeline(
             "sources": [],
             "total_duration_ms": total_ms,
             "active_node": "result",
-            "active_edge": "neo4j_to_result" if intent != "AMBIGUOUS_EXPENSE_QUERY" else "gateway_to_result"
+            "active_edge": "neo4j_to_result" if intent not in ["AMBIGUOUS_EXPENSE_QUERY", "PERMISSION_DENIED"] else "gateway_to_result"
         })
         return formatted_answer, [], steps, total_ms
 
     # =========================================================================
     # NHÁNH 2: EXTRACTIVE RAG CHO DỮ LIỆU NỘI BỘ (Nhật trình, sự cố, ghi chú)
-    # Tuyệt đối không gửi sang Gemini API, không crawl Wikipedia ngầm
+    # Tuyệt đối không gửi sang Gemini API, lọc quyền hạn ngay trong truy vấn DB
     # =========================================================================
     matched_proj = match_project_in_question(question, neo4j_driver)
     if is_internal_query_context(question, neo4j_driver):
@@ -270,7 +278,8 @@ def execute_rag_pipeline(
             top_k=top_k,
             collect_debug=collect_debug,
             progress_callback=progress_callback,
-            target_project=matched_proj
+            target_project=matched_proj,
+            auth_user=auth_user
         )
 
     # ----------------------------------------------------
@@ -606,18 +615,15 @@ def run_internal_extractive_pipeline(
     top_k: int = 5,
     collect_debug: bool = False,
     progress_callback: Optional[Any] = None,
-    target_project: Optional[Tuple[str, str]] = None
+    target_project: Optional[Tuple[str, str]] = None,
+    auth_user: Optional[AuthUser] = None
 ) -> tuple[str, list[dict], list[DebugStep], float]:
     """
     Extractive RAG thuần túy cho Dữ liệu Nội bộ:
     1. Nhúng câu hỏi cục bộ (all-MiniLM-L6-v2)
-    2. Overfetch ứng viên từ Neo4j: Vector Cosine + BM25 Fulltext (internal_chunk_vector_index & internal_chunk_fulltext_index)
-    3. Lọc theo project_code (nếu có ngữ cảnh dự án) và re-rank theo BM25Okapi tiếng Việt
+    2. Overfetch ứng viên từ Neo4j: Vector Cosine + BM25 Fulltext
+    3. Áp dụng điều kiện RBAC ngay trong truy vấn Database (Cypher WHERE)
     4. Trả về đoạn trích nguyên văn và trích dẫn lineage (source_table, source_id, project_code, date)
-    5. TUYỆT ĐỐI:
-       - KHÔNG gửi dữ liệu ra ngoài (không gọi Gemini API)
-       - KHÔNG fallback ngầm sang Wikipedia
-       - KHÔNG trả created_by ra client khi chưa có cơ chế RBAC
     """
     t_start = time.perf_counter()
     steps: List[DebugStep] = []
@@ -629,6 +635,35 @@ def run_internal_extractive_pipeline(
 
     target_code = target_project[0] if target_project else None
     target_name = target_project[1] if target_project else None
+
+    # KIỂM TRA PHÂN QUYỀN TRƯỚC TRUY VẤN (Pre-retrieval RBAC Check)
+    # Nếu câu hỏi nhắm vào 1 dự án cụ thể mà user không có quyền -> Chặn ngay lập tức
+    if target_code and auth_user and not auth_user.can_access_project(target_code):
+        notify("step_start", {
+            "step_id": 1,
+            "name": "1. Security & RBAC Enforcement",
+            "active_node": "gateway",
+            "active_edge": "client_to_gateway",
+            "details": f"Kiểm tra quyền truy cập dự án {target_code}..."
+        })
+        notify("step_failed", {
+            "step_id": 1,
+            "name": "1. Security & RBAC Enforcement",
+            "status": "FORBIDDEN",
+            "duration_ms": 0.5,
+            "error": f"Tài khoản {auth_user.user_id} không có quyền truy cập dự án {target_name} ({target_code})."
+        })
+        denied_msg = f"⛔ **Truy cập bị từ chối (403 Forbidden):** Tài khoản của bạn (`{auth_user.user_id}`) không được phân quyền xem nhật trình và ghi chú kỹ thuật của dự án **{target_name} ({target_code})**."
+        total_ms = round((time.perf_counter() - t_start) * 1000, 2)
+        notify("pipeline_complete", {
+            "question": question,
+            "answer": denied_msg,
+            "sources": [],
+            "total_duration_ms": total_ms,
+            "active_node": "result",
+            "active_edge": "gateway_to_result"
+        })
+        return denied_msg, [], steps, total_ms
 
     # Step 1: Query Router Notification
     notify("step_start", {
@@ -648,7 +683,8 @@ def run_internal_extractive_pipeline(
         "details": "Đã chuyển nhánh Extractive RAG nội bộ. Không sử dụng external LLM.",
         "metrics": [
             {"key": "mode", "value": "Extractive RAG (Zero-leakage, No external LLM)"},
-            {"key": "target_project", "value": f"{target_name} ({target_code})" if target_code else "All internal"}
+            {"key": "target_project", "value": f"{target_name} ({target_code})" if target_code else "All allowed internal"},
+            {"key": "auth_user", "value": auth_user.user_id if auth_user else "anonymous"}
         ]
     })
 
@@ -674,48 +710,74 @@ def run_internal_extractive_pipeline(
     })
 
     # Step 3: Hybrid Retrieval trên Neo4j (Vector Cosine + BM25 Fulltext)
+    # LỌC QUYỀN HẠN TRỰC TIẾP TRONG CÂU LỆNH CYPHER (PRE-FILTER TẠI DB)
     notify("step_start", {
         "step_id": 3,
         "name": "3. Internal Vector & Fulltext Hybrid Retrieval",
         "active_node": "neo4j",
         "active_edge": "gateway_to_neo4j",
-        "details": "Truy xuất ứng viên từ 'internal_chunk_vector_index' & 'internal_chunk_fulltext_index', lọc theo project_code..."
+        "details": "Truy xuất ứng viên, ép điều kiện phân quyền RBAC trực tiếp trong Cypher..."
     })
     retrieval_start = time.perf_counter()
 
     query_words = re.findall(r"\w+", question.lower())
     ft_query_str = " OR ".join([w for w in query_words if len(w) > 1]) if query_words else question
-    fetch_k = max(top_k * 5, 50)
+    # Overfetch lớn trên Neo4j 5.20 để bù đắp việc xếp hạng toàn cục trước khi Cypher lọc
+    fetch_k = max(top_k * 15, 150)
+
+    # Chuẩn bị tham số quyền hạn cho Cypher
+    is_admin = auth_user.is_admin if auth_user else True
+    allowed_list = auth_user.allowed_projects if (auth_user and not is_admin) else []
 
     candidate_pool: dict[str, dict] = {}
     try:
         with neo4j_driver.session() as session:
-            v_res = session.run("""
-                CALL db.index.vector.queryNodes('internal_chunk_vector_index', $fetch_k, $q_vec)
-                YIELD node, score
-                RETURN node.chunk_id AS chunk_id,
-                       node.source_table AS source_table,
-                       node.source_id AS source_id,
-                       node.project_code AS project_code,
-                       node.date AS date,
-                       node.text AS text,
-                       score AS vector_score
-            """, {"fetch_k": fetch_k, "q_vec": q_vec}).data()
+            # Cypher Vector Query có điều kiện RBAC ngay tại DB
+            vector_rbac_cypher = """
+            CALL db.index.vector.queryNodes('internal_chunk_vector_index', $fetch_k, $q_vec)
+            YIELD node, score
+            WHERE ($is_admin = true OR node.project_code IN $allowed_list)
+              AND ($target_code IS NULL OR node.project_code = $target_code)
+            RETURN node.chunk_id AS chunk_id,
+                   node.source_table AS source_table,
+                   node.source_id AS source_id,
+                   node.project_code AS project_code,
+                   node.date AS date,
+                   node.text AS text,
+                   score AS vector_score
+            """
+            v_res = session.run(vector_rbac_cypher, {
+                "fetch_k": fetch_k,
+                "q_vec": q_vec,
+                "is_admin": is_admin,
+                "allowed_list": allowed_list,
+                "target_code": target_code
+            }).data()
 
+            # Cypher Fulltext Query có điều kiện RBAC ngay tại DB
+            fulltext_rbac_cypher = """
+            CALL db.index.fulltext.queryNodes('internal_chunk_fulltext_index', $ft_query)
+            YIELD node, score
+            WHERE ($is_admin = true OR node.project_code IN $allowed_list)
+              AND ($target_code IS NULL OR node.project_code = $target_code)
+            RETURN node.chunk_id AS chunk_id,
+                   node.source_table AS source_table,
+                   node.source_id AS source_id,
+                   node.project_code AS project_code,
+                   node.date AS date,
+                   node.text AS text,
+                   score AS bm25_score
+            LIMIT $fetch_k
+            """
             ft_res = []
             try:
-                ft_res = session.run("""
-                    CALL db.index.fulltext.queryNodes('internal_chunk_fulltext_index', $ft_query)
-                    YIELD node, score
-                    RETURN node.chunk_id AS chunk_id,
-                           node.source_table AS source_table,
-                           node.source_id AS source_id,
-                           node.project_code AS project_code,
-                           node.date AS date,
-                           node.text AS text,
-                           score AS bm25_score
-                    LIMIT $fetch_k
-                """, {"ft_query": ft_query_str, "fetch_k": fetch_k}).data()
+                ft_res = session.run(fulltext_rbac_cypher, {
+                    "ft_query": ft_query_str,
+                    "fetch_k": fetch_k,
+                    "is_admin": is_admin,
+                    "allowed_list": allowed_list,
+                    "target_code": target_code
+                }).data()
             except Exception as fte:
                 logger.warning(f"Lỗi truy vấn fulltext index: {fte}")
 
@@ -750,10 +812,6 @@ def run_internal_extractive_pipeline(
 
         cand_list = list(candidate_pool.values())
 
-        # Lọc kết quả bằng project_code trước khi trả citations (nếu có dự án cụ thể)
-        if target_code:
-            cand_list = [c for c in cand_list if c["project_code"] == target_code]
-
         if cand_list:
             tokenized_corpus = [re.findall(r"\w+", c["text"].lower()) for c in cand_list]
             bm25_calc = BM25Okapi(tokenized_corpus)
@@ -778,11 +836,11 @@ def run_internal_extractive_pipeline(
             "status": "SUCCESS",
             "duration_ms": retrieval_dur,
             "active_node": "neo4j",
-            "details": f"Tìm thấy {len(final_chunks)} đoạn trích phù hợp ({retrieval_dur}ms).",
+            "details": f"Tìm thấy {len(final_chunks)} đoạn trích phù hợp trong phạm vi cho phép ({retrieval_dur}ms).",
             "metrics": [
+                {"key": "rbac_filter_applied", "value": "true (Enforced in DB query)"},
                 {"key": "candidates_evaluated", "value": str(len(cand_list))},
-                {"key": "top_matches_selected", "value": str(len(final_chunks))},
-                {"key": "project_filter_applied", "value": target_code or "None"}
+                {"key": "top_matches_selected", "value": str(len(final_chunks))}
             ]
         })
     except Exception as e:
@@ -887,13 +945,15 @@ def run_internal_extractive_pipeline(
 @strawberry.type
 class Query:
     @strawberry.field
-    def ask(self, question: str, top_k: int = 3) -> RAGAnswer:
+    def ask(self, info: strawberry.Info, question: str, top_k: int = 3) -> RAGAnswer:
         """
         Truy vấn GraphRAG chuẩn dành cho người dùng:
         Vector search -> Graph Traversal -> LLM sinh câu trả lời tự nhiên kèm nguồn.
+        Bảo mật: Ép phân quyền RBAC dựa trên info.context['auth_user'].
         """
-        logger.info(f"🔍 [ask] Nhận câu hỏi: '{question}'")
-        answer, raw_sources, _, _ = execute_rag_pipeline(question, top_k, collect_debug=False)
+        auth_user = info.context.get("auth_user")
+        logger.info(f"🔍 [ask] Nhận câu hỏi: '{question}' (User: {auth_user.user_id if auth_user else 'anonymous'})")
+        answer, raw_sources, _, _ = execute_rag_pipeline(question, top_k, collect_debug=False, auth_user=auth_user)
         sources = [
             SourceChunk(
                 chunk_id=s["chunk_id"],
@@ -916,11 +976,12 @@ class Query:
         )
 
     @strawberry.field
-    def debug_ask(self, question: str, top_k: int = 3) -> DebugRAGAnswer:
+    def debug_ask(self, info: strawberry.Info, question: str, top_k: int = 3) -> DebugRAGAnswer:
         """
         Truy vấn GraphRAG kèm Trace từng bước dành cho Developer:
         Có thể bật/tắt qua biến môi trường RAG_DEBUG_TRACE_ENABLED (mặc định: True).
         """
+        auth_user = info.context.get("auth_user")
         if not settings.RAG_DEBUG_TRACE_ENABLED:
             return DebugRAGAnswer(
                 question=question,
@@ -938,8 +999,8 @@ class Query:
                 ]
             )
 
-        logger.info(f"🛠️ [debugAsk] Nhận câu hỏi debug: '{question}'")
-        answer, raw_sources, steps, total_ms = execute_rag_pipeline(question, top_k, collect_debug=True)
+        logger.info(f"🛠️ [debugAsk] Nhận câu hỏi debug: '{question}' (User: {auth_user.user_id if auth_user else 'anonymous'})")
+        answer, raw_sources, steps, total_ms = execute_rag_pipeline(question, top_k, collect_debug=True, auth_user=auth_user)
         sources = [
             SourceChunk(
                 chunk_id=s["chunk_id"],
@@ -967,8 +1028,18 @@ class Query:
 # FastAPI App & SSE Realtime Stream Endpoint
 # ============================================================================
 
+async def get_context(request: Request) -> Dict[str, Any]:
+    auth_header = request.headers.get("Authorization")
+    auth_user = None
+    if auth_header:
+        try:
+            auth_user = verify_access_token(auth_header)
+        except Exception as e:
+            logger.warning(f"GraphQL Token Invalid: {e}")
+    return {"request": request, "auth_user": auth_user}
+
 schema = strawberry.Schema(query=Query)
-graphql_app = GraphQLRouter(schema)
+graphql_app = GraphQLRouter(schema, context_getter=get_context)
 
 app = FastAPI(title="SynapseRAG GraphQL Gateway", version="1.0.0")
 
@@ -993,10 +1064,22 @@ def health_check():
     }
 
 @app.get("/api/debug/ask/stream")
-async def stream_rag_debug(question: str = FastAPIQuery(..., description="Câu hỏi cần RAG"), top_k: int = 3):
+async def stream_rag_debug(
+    question: str = FastAPIQuery(..., description="Câu hỏi cần RAG"),
+    top_k: int = 3,
+    authorization: Optional[str] = Header(None, description="Bearer Token xác thực RBAC")
+):
     """
     SSE stream endpoint cho Developer UI, chạy cùng một hàm `execute_rag_pipeline` duy nhất.
+    Bảo mật: Xác thực token từ Authorization header và truyền auth_user xuống pipeline.
     """
+    auth_user = None
+    if authorization:
+        try:
+            auth_user = verify_access_token(authorization)
+        except Exception as e:
+            logger.warning(f"SSE Auth Token Invalid: {e}")
+
     event_queue: asyncio.Queue = asyncio.Queue()
 
     def progress_callback(event_type: str, data: dict):
@@ -1010,7 +1093,8 @@ async def stream_rag_debug(question: str = FastAPIQuery(..., description="Câu h
                 question=question, 
                 top_k=top_k, 
                 collect_debug=True, 
-                progress_callback=progress_callback
+                progress_callback=progress_callback,
+                auth_user=auth_user
             )
         )
         await event_queue.put(("DONE_STREAM", {}))

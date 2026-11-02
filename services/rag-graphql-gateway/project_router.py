@@ -34,10 +34,11 @@ def match_project_in_question(question: str, driver: Driver) -> Optional[Tuple[s
                 return code, name
     return None
 
-def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str, Any]]:
+def execute_structured_query(question: str, driver: Driver, auth_user: Optional[Any] = None) -> Optional[Dict[str, Any]]:
     """
     Xác định ý định và thực thi Parameterized Cypher định nghĩa sẵn.
     Đo thời gian thực tế của câu truy vấn Cypher và trả về `cypher_dur_ms`.
+    BẢO MẬT: Kiểm tra quyền truy cập dự án của auth_user trước khi thực thi.
     """
     q_lower = question.lower()
 
@@ -48,6 +49,14 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
         proj_match = match_project_in_question(question, driver)
         if proj_match:
             p_code, p_name = proj_match
+            # RBAC Check: Nếu user không có quyền truy cập dự án này -> Từ chối ngay
+            if auth_user and not auth_user.can_access_project(p_code):
+                return {
+                    "intent": "PERMISSION_DENIED",
+                    "cypher_duration_ms": 0.0,
+                    "formatted_answer": f"⛔ **Truy cập bị từ chối (403 Forbidden):** Tài khoản của bạn (`{auth_user.user_id}`) không được phân quyền truy cập thông tin của dự án **{p_name} ({p_code})**."
+                }
+
             cypher = """
             MATCH (p:Project {code: $code})-[:HAS_TASK]->(t:Task)
             WHERE coalesce(t.is_section_header, false) = false
@@ -87,6 +96,14 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
         proj_match = match_project_in_question(question, driver)
         if proj_match:
             p_code, p_name = proj_match
+            # RBAC Check
+            if auth_user and not auth_user.can_access_project(p_code):
+                return {
+                    "intent": "PERMISSION_DENIED",
+                    "cypher_duration_ms": 0.0,
+                    "formatted_answer": f"⛔ **Truy cập bị từ chối (403 Forbidden):** Tài khoản của bạn (`{auth_user.user_id}`) không được phân quyền xem chi phí hạch toán của dự án **{p_name} ({p_code})**."
+                }
+
             cypher = """
             MATCH (p:Project {code: $code})-[:HAS_EXPENSE]->(e:Expense)
             RETURN p.name AS project_name,
@@ -119,8 +136,15 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
                     "formatted_answer": f"Dự án **{p_name} ({p_code})** hiện chưa phát sinh chứng từ chi phí thực tế trong hệ thống hạch toán."
                 }
         else:
-            # Câu hỏi mơ hồ về chi phí: Không tự suy diễn hay trả tổng toàn công ty khi chưa chỉ rõ phạm vi
+            # Câu hỏi toàn công ty: Chỉ Admin mới được quyền xem tổng kinh phí toàn công ty
             if any(k in q_lower for k in ["toàn công ty", "tất cả dự án", "toàn bộ dự án", "tổng công ty"]):
+                if auth_user and not auth_user.is_admin:
+                    return {
+                        "intent": "PERMISSION_DENIED",
+                        "cypher_duration_ms": 0.0,
+                        "formatted_answer": "⛔ **Truy cập bị từ chối (403 Forbidden):** Chỉ tài khoản Quản trị viên (Admin) mới có quyền truy cập tổng chi phí toàn công ty."
+                    }
+
                 cypher = """
                 MATCH (e:Expense)
                 RETURN count(e) AS total_records,
@@ -143,7 +167,6 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
                     )
                 }
             else:
-                # Câu hỏi không rõ phạm vi: Yêu cầu làm rõ, không chạy Cypher và không trả số liệu đoán mò
                 return {
                     "intent": "AMBIGUOUS_EXPENSE_QUERY",
                     "cypher_duration_ms": 0.0,
@@ -161,6 +184,14 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
         proj_match = match_project_in_question(question, driver)
         if proj_match:
             p_code, p_name = proj_match
+            # RBAC Check
+            if auth_user and not auth_user.can_access_project(p_code):
+                return {
+                    "intent": "PERMISSION_DENIED",
+                    "cypher_duration_ms": 0.0,
+                    "formatted_answer": f"⛔ **Truy cập bị từ chối (403 Forbidden):** Tài khoản của bạn (`{auth_user.user_id}`) không được phân quyền xem kế hoạch mua sắm của dự án **{p_name} ({p_code})**."
+                }
+
             cypher = """
             MATCH (p:Project {code: $code})-[:HAS_PURCHASE_PLAN]->(pp:PurchasingPlan)
             RETURN p.name AS project_name,
@@ -200,6 +231,14 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
         proj_match = match_project_in_question(question, driver)
         if proj_match:
             p_code, p_name = proj_match
+            # RBAC Check
+            if auth_user and not auth_user.can_access_project(p_code):
+                return {
+                    "intent": "PERMISSION_DENIED",
+                    "cypher_duration_ms": 0.0,
+                    "formatted_answer": f"⛔ **Truy cập bị từ chối (403 Forbidden):** Tài khoản của bạn (`{auth_user.user_id}`) không được phân quyền xem danh mục vật tư của dự án **{p_name} ({p_code})**."
+                }
+
             cypher = """
             MATCH (p:Project {code: $code})-[:REQUIRES_MATERIAL]->(mp:MaterialPlan)
             RETURN p.name AS project_name,
@@ -226,9 +265,6 @@ def execute_structured_query(question: str, driver: Driver) -> Optional[Dict[str
 def is_internal_query_context(question: str, driver: Driver) -> bool:
     """
     Kiểm tra xem câu hỏi có thuộc ngữ cảnh dữ liệu nội bộ dự án không.
-    Trả về True nếu:
-    1. Trùng khớp với bất kỳ project_code hoặc tên dự án nào trong DB Neo4j.
-    2. Chứa các từ khóa nghiệp vụ dự án nội bộ (nhật trình, hiện trường, sự cố, ghi chú kỹ thuật, quy cách...).
     """
     if match_project_in_question(question, driver):
         return True
