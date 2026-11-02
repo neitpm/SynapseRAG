@@ -547,9 +547,9 @@ def main():
 
             logger.info(f"📥 Đang nạp {expected_count} chunks vào vùng Staging (version: {version_tag}, job_id: {job_id}, token: {lock_mgr.fencing_token})...")
             
-            # GẮN FENCING TOKEN TRỰC TIẾP VÀO CÂU LỆNH GHI CYPHER (Atomic Write Fencing)
-            # Nếu s.lock_job_id hoặc s.lock_generation bị thay đổi giữa chừng (do takeover),
-            # mệnh đề MATCH/WHERE sẽ trả về rỗng, lệnh UNWIND không chạy và không có node nào được ghi.
+            # Tách bạch rõ ràng:
+            # 1. Ghi InternalChunk nguyên tử có gắn Fencing Token và đếm chính xác số chunk đã ghi
+            # 2. Tạo quan hệ HAS_INTERNAL_CHUNK bằng OPTIONAL MATCH / WITH riêng biệt để không lọc mất chunk
             fenced_ingest_cypher = """
             MATCH (s:SystemConfig {id: 'internal_rag_state'})
             WHERE s.lock_job_id = $job_id AND s.lock_generation = $token
@@ -566,9 +566,10 @@ def main():
                 c.version = row.version,
                 c.ingestion_job_id = row.ingestion_job_id
             WITH c, row
-            WHERE row.project_code IS NOT NULL AND row.project_code <> ''
-            MATCH (p:Project {code: row.project_code})
-            MERGE (p)-[:HAS_INTERNAL_CHUNK]->(c)
+            OPTIONAL MATCH (p:Project {code: row.project_code})
+            FOREACH (_ IN CASE WHEN p IS NOT NULL THEN [1] ELSE [] END |
+                MERGE (p)-[:HAS_INTERNAL_CHUNK]->(c)
+            )
             RETURN count(c) AS written_chunks
             """
 
@@ -582,11 +583,18 @@ def main():
 
                 written_count = write_res["written_chunks"] if write_res else 0
                 if written_count != len(batch):
-                    raise RuntimeError(
-                        f"🛑 FENCING TOKEN VIOLATION TẠI BATCH {batch_idx}: "
-                        f"Chỉ ghi được {written_count}/{len(batch)} chunks! "
-                        f"Job đã bị mất quyền sở hữu lock giữa chừng. DỪNG NGAY TIẾN TRÌNH."
-                    )
+                    # Chẩn đoán chính xác nguyên nhân: Kiểm tra xem lock có bị mất/takeover không
+                    is_owner = lock_mgr.verify_ownership()
+                    if not is_owner:
+                        raise RuntimeError(
+                            f"🛑 FENCING TOKEN VIOLATION TẠI BATCH {batch_idx}: "
+                            f"Ghi được {written_count}/{len(batch)} chunks vì job đã mất quyền sở hữu lock! DỪNG TIẾN TRÌNH."
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"⚠️ BATCH WRITE INTEGRITY FAILURE TẠI BATCH {batch_idx}: "
+                            f"Số lượng chunk ghi nhận ({written_count}) không khớp batch ({len(batch)}) dù lock vẫn hợp lệ!"
+                        )
 
             # 6. XÁC MINH 1: Tính toàn vẹn số lượng chunks (kiểm tra theo cả version và ingestion_job_id)
             logger.info("🔍 Đang xác minh tính toàn vẹn số lượng chunk của phiên bản mới...")
