@@ -100,15 +100,16 @@ class IngestionLockManager:
                         f"⚠️ CRASH RECOVERY: Phát hiện job trước bị treo/crash quá hạn lease "
                         f"(> {LEASE_DURATION_SECONDS}s). Đã tiếp quản lock an toàn [job_id: {self.job_id}, fencing_token: {self.fencing_token}]."
                     )
-                    if old_ver or old_jid:
-                        logger.info(f"🧹 Đang xóa các chunk staging mồ côi theo cả version ({old_ver}) và job_id ({old_jid})...")
+                    if old_ver and old_jid:
+                        logger.info(f"🧹 Đang xóa các chunk staging mồ côi theo cả version ({old_ver}) VÀ job_id ({old_jid})...")
                         session.run("""
                             MATCH (c:InternalChunk)
-                            WHERE (c.version = $ver AND $ver IS NOT NULL)
-                               OR (c.ingestion_job_id = $jid AND $jid IS NOT NULL)
+                            WHERE c.version = $ver AND c.ingestion_job_id = $jid
                             DETACH DELETE c
                         """, ver=old_ver, jid=old_jid)
                         logger.info("✅ Đã dọn dẹp xong staging mồ côi.")
+                    elif old_ver:
+                        session.run("MATCH (c:InternalChunk {version: $ver}) DETACH DELETE c", ver=old_ver)
 
                 logger.info(f"🔒 Đã chiếm Ingestion Lock thành công [job_id: {self.job_id}, fencing_token: {self.fencing_token}, staging_version: {self.staging_version}]")
                 self._start_heartbeat()
@@ -193,12 +194,11 @@ class IngestionLockManager:
             ).single()
             if res:
                 logger.info(f"🔓 Đã chuyển trạng thái FAILED và giải phóng lock [job_id: {self.job_id}, token: {self.fencing_token}]")
-                # Xóa sạch toàn bộ staging chunks gắn với ingestion_job_id của job này
+                # Xóa sạch staging chunks thỏa mãn cả ingestion_job_id VÀ version của job này
                 logger.info(f"🧹 Đang xóa các chunk staging của job lỗi [job_id: {self.job_id}, version: {self.staging_version}]...")
                 session.run("""
                     MATCH (c:InternalChunk)
-                    WHERE (c.ingestion_job_id = $job_id AND $job_id IS NOT NULL)
-                       OR (c.version = $ver AND $ver IS NOT NULL)
+                    WHERE c.ingestion_job_id = $job_id AND c.version = $ver
                     DETACH DELETE c
                 """, job_id=self.job_id, ver=self.staging_version)
                 logger.info(f"✅ Đã dọn dẹp xong staging lỗi ({self.staging_version}).")
@@ -545,8 +545,15 @@ def main():
         with driver.session() as session:
             init_internal_indexes(session)
 
-            logger.info(f"📥 Đang nạp {expected_count} chunks vào vùng Staging (version: {version_tag}, job_id: {job_id})...")
-            ingest_cypher = """
+            logger.info(f"📥 Đang nạp {expected_count} chunks vào vùng Staging (version: {version_tag}, job_id: {job_id}, token: {lock_mgr.fencing_token})...")
+            
+            # GẮN FENCING TOKEN TRỰC TIẾP VÀO CÂU LỆNH GHI CYPHER (Atomic Write Fencing)
+            # Nếu s.lock_job_id hoặc s.lock_generation bị thay đổi giữa chừng (do takeover),
+            # mệnh đề MATCH/WHERE sẽ trả về rỗng, lệnh UNWIND không chạy và không có node nào được ghi.
+            fenced_ingest_cypher = """
+            MATCH (s:SystemConfig {id: 'internal_rag_state'})
+            WHERE s.lock_job_id = $job_id AND s.lock_generation = $token
+            WITH s
             UNWIND $batch AS row
             MERGE (c:InternalChunk {chunk_id: row.chunk_id})
             SET c.source_table = row.source_table,
@@ -562,13 +569,24 @@ def main():
             WHERE row.project_code IS NOT NULL AND row.project_code <> ''
             MATCH (p:Project {code: row.project_code})
             MERGE (p)-[:HAS_INTERNAL_CHUNK]->(c)
+            RETURN count(c) AS written_chunks
             """
 
-            for batch in chunk_list(chunks, 200):
-                # Kiểm tra Fencing Token trước mỗi batch ghi (tránh ghi đè khi bị takeover sau partition)
-                if not lock_mgr.verify_ownership():
-                    raise RuntimeError("Mất quyền sở hữu Ingestion Lock do Fencing Token không khớp! Ngừng nạp batch.")
-                session.run(ingest_cypher, batch=batch)
+            for batch_idx, batch in enumerate(chunk_list(chunks, 200), 1):
+                write_res = session.run(
+                    fenced_ingest_cypher,
+                    job_id=job_id,
+                    token=lock_mgr.fencing_token,
+                    batch=batch
+                ).single()
+
+                written_count = write_res["written_chunks"] if write_res else 0
+                if written_count != len(batch):
+                    raise RuntimeError(
+                        f"🛑 FENCING TOKEN VIOLATION TẠI BATCH {batch_idx}: "
+                        f"Chỉ ghi được {written_count}/{len(batch)} chunks! "
+                        f"Job đã bị mất quyền sở hữu lock giữa chừng. DỪNG NGAY TIẾN TRÌNH."
+                    )
 
             # 6. XÁC MINH 1: Tính toàn vẹn số lượng chunks (kiểm tra theo cả version và ingestion_job_id)
             logger.info("🔍 Đang xác minh tính toàn vẹn số lượng chunk của phiên bản mới...")
