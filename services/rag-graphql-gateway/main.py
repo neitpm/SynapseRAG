@@ -105,6 +105,12 @@ INGESTION_LAST_TOTAL_CHUNKS = Gauge(
     "Tổng số chunks đã nạp thành công của phiên bản active_version hiện hành"
 )
 
+# 9. Đo lường chất lượng dữ liệu đồ thị (Data Quality Observability)
+DATA_QUALITY_UNCLASSIFIED_PROJECTS = Gauge(
+    "rag_data_quality_unclassified_projects_total",
+    "Số lượng node Project trong CSDL đồ thị chưa được gán nhãn thuộc tính project_type"
+)
+
 # Khởi tạo SentenceTransformer model (dùng chung all-MiniLM-L6-v2 384-dims)
 logger.info(f"Đang tải Embedding model '{settings.EMBEDDING_MODEL}'...")
 embedder = SentenceTransformer(settings.EMBEDDING_MODEL)
@@ -1289,6 +1295,15 @@ def metrics_endpoint(
                 RAG_INGESTION_METRICS_SOURCE_UP.set(1)
             else:
                 RAG_INGESTION_METRICS_SOURCE_UP.set(0)
+
+            # Đồng bộ metric chất lượng dữ liệu: số node Project thiếu project_type
+            dq_res = session.run("""
+                MATCH (p:Project)
+                WHERE p.project_type IS NULL OR trim(p.project_type) = ''
+                RETURN count(p) AS unclassified_cnt
+            """).single()
+            if dq_res:
+                DATA_QUALITY_UNCLASSIFIED_PROJECTS.set(dq_res["unclassified_cnt"])
     except Exception as e:
         logger.warning(f"Không thể sync ingestion metrics từ Neo4j: {e}")
         RAG_INGESTION_METRICS_SOURCE_UP.set(0)

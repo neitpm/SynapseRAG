@@ -314,11 +314,11 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                        expense_count,
                        total_cost
                 """
-                # 3. Kiểm tra cảnh báo dữ liệu: Các node Project có phát sinh chi phí nhưng thiếu project_type
+                # 3. Kiểm tra chất lượng dữ liệu TOÀN BỘ danh mục dự án (không phụ thuộc vào việc đã có phiếu chi hay chưa)
                 cypher_unclassified = """
-                MATCH (p:Project)-[:INCURRED_EXPENSE]->(e:Expense)
+                MATCH (p:Project)
                 WHERE p.project_type IS NULL OR trim(p.project_type) = ''
-                RETURN count(DISTINCT p) AS unclassified_count, collect(DISTINCT p.code) AS unclassified_codes
+                RETURN count(p) AS unclassified_count, collect(p.code) AS unclassified_codes
                 """
                 c_start = time.perf_counter()
                 with driver.session() as session:
@@ -341,7 +341,7 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                             lines.append(f"- **{r['project_name']}** (`{r['project_code']}`): **{cost_str}** ({r['expense_count']} phiếu chi)")
 
                     if unclass_res and unclass_res["unclassified_count"] > 0:
-                        lines.append(f"\n⚠️ **Cảnh báo chất lượng dữ liệu:** Có {unclass_res['unclassified_count']} node Project chưa phân loại `project_type` ({unclass_res['unclassified_codes']}) nên không được đưa vào bảng xếp hạng.")
+                        lines.append(f"\n⚠️ **Cảnh báo chất lượng dữ liệu danh mục:** Phát hiện {unclass_res['unclassified_count']} dự án trong hệ thống chưa được phân loại `project_type` ({unclass_res['unclassified_codes']}).")
 
                     lines.append("\n*(Dữ liệu phân loại tường minh theo thuộc tính nghiệp vụ `project_type: CONSTRUCTION vs OPERATIONAL` từ CSDL đồ thị)*")
                     return {
