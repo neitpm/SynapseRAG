@@ -50,14 +50,23 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
     q_lower = question.lower()
 
     # -------------------------------------------------------------------------
-    # INTENT 0: Thống kê số lượng / Danh sách dự án trong hệ thống
+    # INTENT 0: Thống kê số lượng / Danh sách dự án trong hệ thống (Hỗ trợ lọc theo cấp điện áp hoặc từ khóa)
     # -------------------------------------------------------------------------
     if any(k in q_lower for k in [
         "bao nhiêu dự án", "số lượng dự án", "danh sách dự án", "có những dự án nào",
         "liệt kê dự án", "dự án nào", "tổng số dự án"
     ]) and not any(k in q_lower for k in ["chi phí", "tiến độ", "vật tư", "nhật trình"]):
+        # Trích xuất bộ lọc (ví dụ: 110kv, 220kv, 500kv, trạm biến áp, đường dây,...)
+        filter_keyword = None
+        filter_label = None
+        for kw in ["110kv", "220kv", "500kv", "trạm biến áp", "đường dây", "thuỷ điện", "thủy điện"]:
+            if kw in q_lower:
+                filter_keyword = kw
+                filter_label = kw.upper() if "kv" in kw else kw.title()
+                break
+
         if not auth_user.is_admin:
-            # Nếu là user thường: Chỉ hiển thị các dự án user được phân quyền
+            # Nếu là user thường: Chỉ hiển thị các dự án user được phân quyền (có áp dụng filter nếu có)
             allowed = auth_user.allowed_projects
             if not allowed:
                 return {
@@ -65,46 +74,78 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                     "cypher_duration_ms": 0.0,
                     "formatted_answer": f"Tài khoản của bạn (`{auth_user.user_id}`) hiện chưa được phân quyền truy cập dự án nào trong hệ thống."
                 }
-            cypher = """
-            MATCH (p:Project)
-            WHERE p.code IN $allowed
-            RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
-            """
+            if filter_keyword:
+                cypher = """
+                MATCH (p:Project)
+                WHERE p.code IN $allowed AND (toLower(p.name) CONTAINS $filter OR toLower(p.code) CONTAINS $filter)
+                RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
+                """
+                params = {"allowed": allowed, "filter": filter_keyword}
+            else:
+                cypher = """
+                MATCH (p:Project)
+                WHERE p.code IN $allowed
+                RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
+                """
+                params = {"allowed": allowed}
+
             c_start = time.perf_counter()
             with driver.session() as session:
-                rec = session.run(cypher, allowed=allowed).single()
+                rec = session.run(cypher, **params).single()
             c_dur = round((time.perf_counter() - c_start) * 1000, 2)
             total = rec["total_projects"]
-            proj_items = "\n".join([f"- {name}" for name in rec["project_list"]])
-            return {
-                "intent": "PROJECT_LIST_RBAC",
-                "cypher_duration_ms": c_dur,
-                "formatted_answer": (
-                    f"📁 **Danh sách dự án bạn được phân quyền truy cập ({total} dự án):**\n\n"
+            if total > 0:
+                proj_items = "\n".join([f"- {name}" for name in rec["project_list"]])
+                qualifier = f" thuộc phân loại **{filter_label}**" if filter_label else ""
+                formatted_answer = (
+                    f"📁 **Danh sách dự án{qualifier} bạn được phân quyền truy cập ({total} dự án):**\n\n"
                     f"{proj_items}\n\n"
                     f"*(Tài khoản: `{auth_user.user_id}` - Phân quyền theo dự án được gán)*"
                 )
+            else:
+                formatted_answer = f"Trong các dự án bạn được phân quyền, hiện không có dự án nào thuộc phân loại **{filter_label}**."
+
+            return {
+                "intent": "PROJECT_LIST_RBAC",
+                "cypher_duration_ms": c_dur,
+                "formatted_answer": formatted_answer
             }
         else:
-            # Nếu là Admin: Hiển thị toàn bộ 24 dự án
-            cypher = """
-            MATCH (p:Project)
-            RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
-            """
+            # Nếu là Admin: Hiển thị toàn bộ hoặc lọc theo điều kiện
+            if filter_keyword:
+                cypher = """
+                MATCH (p:Project)
+                WHERE toLower(p.name) CONTAINS $filter OR toLower(p.code) CONTAINS $filter
+                RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
+                """
+                params = {"filter": filter_keyword}
+            else:
+                cypher = """
+                MATCH (p:Project)
+                RETURN count(p) AS total_projects, collect(p.name + ' (' + p.code + ')') AS project_list
+                """
+                params = {}
+
             c_start = time.perf_counter()
             with driver.session() as session:
-                rec = session.run(cypher).single()
+                rec = session.run(cypher, **params).single()
             c_dur = round((time.perf_counter() - c_start) * 1000, 2)
             total = rec["total_projects"]
-            proj_items = "\n".join([f"- {name}" for name in rec["project_list"]])
-            return {
-                "intent": "PROJECT_LIST_ALL",
-                "cypher_duration_ms": c_dur,
-                "formatted_answer": (
-                    f"🏢 **Tổng quan hệ thống: Hiện có {total} dự án công trình đang quản lý:**\n\n"
+            if total > 0:
+                proj_items = "\n".join([f"- {name}" for name in rec["project_list"]])
+                qualifier = f" **{filter_label}**" if filter_label else ""
+                formatted_answer = (
+                    f"⚡ **Tổng quan hệ thống: Hiện có {total} dự án{qualifier} đang quản lý:**\n\n"
                     f"{proj_items}\n\n"
                     f"*(Quyền Quản trị viên: Toàn quyền truy cập tất cả các dự án)*"
                 )
+            else:
+                formatted_answer = f"Không tìm thấy dự án nào thuộc phân loại **{filter_label}** trong hệ thống."
+
+            return {
+                "intent": "PROJECT_LIST_ALL",
+                "cypher_duration_ms": c_dur,
+                "formatted_answer": formatted_answer
             }
 
     # -------------------------------------------------------------------------
