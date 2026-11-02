@@ -927,12 +927,53 @@ def run_internal_extractive_pipeline(
             min_bm = min(python_bm25_scores) if len(python_bm25_scores) > 0 else 0.0
             rng_bm = (max_bm - min_bm) if (max_bm - min_bm) > 1e-6 else 1.0
 
+            # Nhận diện các ý định nghiệp vụ đặc thù (Business Concept Intent) từ câu hỏi
+            q_clean = question.lower()
+            is_signing_status_query = any(p in q_clean for p in ["chưa ký", "chưa được ký", "đã ký", "ký duyệt", "phê duyệt", "chưa duyệt"])
+
+            # Từ khóa dừng (stop words) không mang bằng chứng nghiệp vụ cốt lõi
+            stop_terms = {"dự", "án", "nào", "đang", "có", "các", "những", "cho", "của", "với", "được", "trong", "là", "bị", "ở", "tại"}
+            key_query_terms = [w for w in query_words if len(w) > 1 and w not in stop_terms]
+
+            filtered_candidates = []
+            seen_texts = set()
+
             for i, c in enumerate(cand_list):
                 norm_bm = (python_bm25_scores[i] - min_bm) / rng_bm
-                c["hybrid_score"] = round(0.6 * c["vector_score"] + 0.4 * norm_bm, 4)
+                v_score = c["vector_score"]
+                c["hybrid_score"] = round(0.6 * v_score + 0.4 * norm_bm, 4)
+                c["bm25_raw"] = float(python_bm25_scores[i])
 
-            cand_list.sort(key=lambda x: x["hybrid_score"], reverse=True)
-            final_chunks = cand_list[:top_k]
+                # 1. Khử trùng lặp nội dung (Deduplication) theo chuỗi văn bản chuẩn hóa
+                norm_text = re.sub(r"\s+", " ", c["text"].strip().lower())
+                if norm_text in seen_texts:
+                    continue
+                seen_texts.add(norm_text)
+
+                text_lower = c["text"].lower()
+
+                # 2. Bộ lọc bảo thủ MVP: Kiểm tra bằng chứng cụm từ nghiệp vụ (Concept Evidence)
+                # Tuyệt đối không dùng token đơn lẻ "ký" (tránh khớp "đăng ký")
+                if is_signing_status_query:
+                    # Với ý định tra cứu ký duyệt: Bắt buộc trong văn bản phải chứa cụm từ ký/phê duyệt thực sự
+                    has_signing_evidence = any(
+                        re.search(rf"\b{re.escape(phrase)}\b", text_lower)
+                        for phrase in ["đã ký", "chưa ký", "ký duyệt", "phê duyệt", "chưa duyệt", "kí duyệt", "đã kí", "chưa kí"]
+                    )
+                    if not has_signing_evidence:
+                        # Từ chối dứt khoát nếu không có bằng chứng ký duyệt nghiệp vụ
+                        continue
+
+                # 3. Với các câu hỏi thông thường: Kiểm tra ranh giới từ (word boundary) cho các từ khóa cốt lõi
+                # Khớp ranh giới từ để 'ký' không khớp trong 'đăng ký', 'án' không khớp trong 'dự án'
+                has_key_term = any(re.search(rf"\b{re.escape(kt)}\b", text_lower) for kt in key_query_terms) if key_query_terms else True
+
+                # Ngưỡng vector tuyệt đối tạm thời cho MVP (Cần đánh giá lại khi có tập golden test)
+                if v_score >= 0.65 and has_key_term:
+                    filtered_candidates.append(c)
+
+            filtered_candidates.sort(key=lambda x: x["hybrid_score"], reverse=True)
+            final_chunks = filtered_candidates[:top_k]
         else:
             final_chunks = []
 
@@ -1015,10 +1056,12 @@ def run_internal_extractive_pipeline(
         lines.append("*(Ghi chú an toàn: Toàn bộ nội dung trên được trích xuất nguyên văn trực tiếp từ CSDL nội bộ. Không gửi dữ liệu sang LLM đám mây)*")
         answer_text = "\n".join(lines)
     else:
+        scope_str = f"của dự án **{target_name} ({target_code})**" if target_name else "các dự án"
         answer_text = (
-            f"⚠️ **Không tìm thấy ghi chú kỹ thuật hoặc nhật trình phù hợp** "
-            f"cho câu hỏi này trong dữ liệu nội bộ của dự án {target_name or ''}.\n"
-            f"*(Hệ thống tuân thủ nguyên tắc không tự suy diễn và không tự động crawl ngoài internet)*"
+            f"⚠️ **Không tìm thấy thông tin phù hợp trong các nguồn hiện được lập chỉ mục:**\n\n"
+            f"Trong kho dữ liệu nhật trình, nhiệm vụ công việc và kế hoạch vật tư hiện tại của {scope_str}, "
+            f"không tìm thấy tài liệu hoặc ghi chú nào đề cập đến nội dung bạn yêu cầu.\n\n"
+            f"*(Hệ thống tuân thủ nguyên tắc Extractive RAG: Chỉ trích xuất từ dữ liệu có thật đã nạp, không tự suy diễn và không tự động tìm kiếm ngoài internet)*"
         )
 
     synthesis_dur = round((time.perf_counter() - synthesis_start) * 1000, 2)
