@@ -32,25 +32,27 @@ HEARTBEAT_INTERVAL_SECONDS = 30  # gửi heartbeat mỗi 30s
 
 class IngestionLockManager:
     """
-    Quản lý khóa phân tán Ingestion Lock với job_id, lease timeout recovery,
-    atomic conditional update và heartbeat.
+    Quản lý khóa phân tán Ingestion Lock với job_id, fencing_token (lock_generation),
+    lease timeout recovery, atomic conditional update và heartbeat.
     """
     def __init__(self, driver, job_id: str, staging_version: str):
         self.driver = driver
         self.job_id = job_id
         self.staging_version = staging_version
+        self.fencing_token = None
         self._stop_heartbeat = threading.Event()
         self._heartbeat_thread = None
 
     def acquire_lock(self) -> bool:
         """
-        Thực hiện Cypher Atomic Conditional Update với khả năng Crash Recovery:
-        Chỉ acquire được khi:
-        1. Chưa có lock: lock_job_id IS NULL (và status IDLE/FAILED)
-        2. Re-entrant: lock_job_id = $job_id
-        3. Crash Recovery (Lease Expired): lock_job_id IS NOT NULL nhưng last_heartbeat_at
-           đã quá hạn > LEASE_DURATION_SECONDS (do tiến trình trước bị crash cứng / kill -9).
-           Khi takeover lease quá hạn, atomic xóa các chunk staging mồ côi của job cũ.
+        Thực hiện Cypher Atomic Conditional Update với Fencing Token và Crash Recovery:
+        - Tăng s.lock_generation (fencing_token) thêm 1 mỗi lần acquire.
+        - Chỉ acquire được khi:
+          1. Chưa có lock: lock_job_id IS NULL (và status IDLE/FAILED)
+          2. Re-entrant: lock_job_id = $job_id
+          3. Crash Recovery (Lease Expired): lock_job_id IS NOT NULL nhưng last_heartbeat_at
+             đã quá hạn > LEASE_DURATION_SECONDS (do job trước bị crash cứng / kill -9 / network partition).
+        - Khi Crash Recovery: xóa sạch các chunk staging mồ côi theo cả old_staging_ver và old_job_id.
         """
         now_ts = int(time.time())
         lease_timeout_ts = now_ts - LEASE_DURATION_SECONDS
@@ -62,20 +64,22 @@ class IngestionLockManager:
            OR (s.lock_job_id = $job_id)
            OR (s.lock_job_id IS NOT NULL AND coalesce(s.last_heartbeat_at, 0) < $lease_timeout_ts)
         
-        // Lưu lại thông tin job mồ côi nếu có recovery
         WITH s, 
              s.lock_job_id AS old_job_id,
              s.staging_version AS old_staging_ver,
              CASE WHEN s.lock_job_id IS NOT NULL AND s.lock_job_id <> $job_id THEN true ELSE false END AS is_recovery
 
-        SET s.lock_job_id = $job_id,
+        SET s.lock_generation = coalesce(s.lock_generation, 0) + 1,
+            s.lock_job_id = $job_id,
             s.staging_version = $staging_version,
             s.ingestion_status = 'INGESTING',
             s.lock_acquired_at = $now_ts,
             s.last_heartbeat_at = $now_ts
         RETURN s.lock_job_id AS lock_job_id, 
                s.staging_version AS staging_version,
+               s.lock_generation AS fencing_token,
                is_recovery,
+               old_job_id,
                old_staging_ver
         """
         with self.driver.session() as session:
@@ -88,18 +92,25 @@ class IngestionLockManager:
             ).single()
 
             if rec and rec["lock_job_id"] == self.job_id:
+                self.fencing_token = rec["fencing_token"]
                 if rec["is_recovery"]:
                     old_ver = rec["old_staging_ver"]
+                    old_jid = rec["old_job_id"]
                     logger.warning(
                         f"⚠️ CRASH RECOVERY: Phát hiện job trước bị treo/crash quá hạn lease "
-                        f"(> {LEASE_DURATION_SECONDS}s). Đã tiếp quản lock an toàn [job_id: {self.job_id}]."
+                        f"(> {LEASE_DURATION_SECONDS}s). Đã tiếp quản lock an toàn [job_id: {self.job_id}, fencing_token: {self.fencing_token}]."
                     )
-                    if old_ver:
-                        logger.info(f"🧹 Đang xóa các chunk staging mồ côi của job cũ ({old_ver})...")
-                        session.run("MATCH (c:InternalChunk {version: $ver}) DETACH DELETE c", ver=old_ver)
-                        logger.info(f"✅ Đã dọn dẹp xong staging mồ côi ({old_ver}).")
+                    if old_ver or old_jid:
+                        logger.info(f"🧹 Đang xóa các chunk staging mồ côi theo cả version ({old_ver}) và job_id ({old_jid})...")
+                        session.run("""
+                            MATCH (c:InternalChunk)
+                            WHERE (c.version = $ver AND $ver IS NOT NULL)
+                               OR (c.ingestion_job_id = $jid AND $jid IS NOT NULL)
+                            DETACH DELETE c
+                        """, ver=old_ver, jid=old_jid)
+                        logger.info("✅ Đã dọn dẹp xong staging mồ côi.")
 
-                logger.info(f"🔒 Đã chiếm Ingestion Lock thành công [job_id: {self.job_id}, staging_version: {self.staging_version}]")
+                logger.info(f"🔒 Đã chiếm Ingestion Lock thành công [job_id: {self.job_id}, fencing_token: {self.fencing_token}, staging_version: {self.staging_version}]")
                 self._start_heartbeat()
                 return True
             else:
@@ -112,18 +123,39 @@ class IngestionLockManager:
                 )
                 return False
 
+    def verify_ownership(self) -> bool:
+        """
+        Fencing check: Xác minh lock vẫn đang thuộc về job_id VÀ fencing_token hiện tại.
+        Nếu job bị treo quá lâu và bị job mới takeover (lock_generation đã tăng), check này sẽ trả về False ngay.
+        """
+        check_cypher = """
+        MATCH (s:SystemConfig {id: 'internal_rag_state'})
+        RETURN s.lock_job_id AS lock_job_id, s.lock_generation AS lock_generation
+        """
+        with self.driver.session() as session:
+            rec = session.run(check_cypher).single()
+            if not rec or rec["lock_job_id"] != self.job_id or rec["lock_generation"] != self.fencing_token:
+                logger.error(
+                    f"🛑 FENCING TOKEN VIOLATION: Mất quyền sở hữu lock! "
+                    f"Job hiện tại: [job_id: {self.job_id}, token: {self.fencing_token}], "
+                    f"DB hiện tại: [job_id: {rec.get('lock_job_id') if rec else None}, token: {rec.get('lock_generation') if rec else None}]. "
+                    f"DỪNG NGAY MỌI THAO TÁC GHI ĐỂ BẢO VỆ CSDL."
+                )
+                return False
+            return True
+
     def _start_heartbeat(self):
         def _beat():
             while not self._stop_heartbeat.wait(HEARTBEAT_INTERVAL_SECONDS):
                 now_ts = int(time.time())
                 beat_cypher = """
                 MATCH (s:SystemConfig {id: 'internal_rag_state'})
-                WHERE s.lock_job_id = $job_id
+                WHERE s.lock_job_id = $job_id AND s.lock_generation = $token
                 SET s.last_heartbeat_at = $now_ts
                 """
                 try:
                     with self.driver.session() as session:
-                        session.run(beat_cypher, job_id=self.job_id, now_ts=now_ts)
+                        session.run(beat_cypher, job_id=self.job_id, token=self.fencing_token, now_ts=now_ts)
                 except Exception as e:
                     logger.warning(f"Lỗi khi gửi heartbeat ingestion lock: {e}")
 
@@ -137,13 +169,13 @@ class IngestionLockManager:
 
     def release_lock_on_failure(self):
         """
-        Khi job thất bại, chỉ giải phóng nếu chính job_id này đang nắm lock.
+        Khi job thất bại, chỉ giải phóng nếu chính job_id và fencing_token này đang nắm lock.
         Đổi trạng thái sang FAILED và dọn dẹp các chunk staging gắn với job_id này.
         """
         self.stop_heartbeat()
         release_cypher = """
         MATCH (s:SystemConfig {id: 'internal_rag_state'})
-        WHERE s.lock_job_id = $job_id
+        WHERE s.lock_job_id = $job_id AND s.lock_generation = $token
         SET s.ingestion_status = 'FAILED',
             s.failed_version = $staging_version,
             s.staging_version = null,
@@ -153,14 +185,20 @@ class IngestionLockManager:
         RETURN s.id
         """
         with self.driver.session() as session:
-            res = session.run(release_cypher, job_id=self.job_id, staging_version=self.staging_version).single()
+            res = session.run(
+                release_cypher,
+                job_id=self.job_id,
+                token=self.fencing_token,
+                staging_version=self.staging_version
+            ).single()
             if res:
-                logger.info(f"🔓 Đã chuyển trạng thái FAILED và giải phóng lock [job_id: {self.job_id}]")
+                logger.info(f"🔓 Đã chuyển trạng thái FAILED và giải phóng lock [job_id: {self.job_id}, token: {self.fencing_token}]")
                 # Xóa sạch toàn bộ staging chunks gắn với ingestion_job_id của job này
                 logger.info(f"🧹 Đang xóa các chunk staging của job lỗi [job_id: {self.job_id}, version: {self.staging_version}]...")
                 session.run("""
                     MATCH (c:InternalChunk)
-                    WHERE c.ingestion_job_id = $job_id OR (c.version = $ver AND c.ingestion_job_id IS NULL)
+                    WHERE (c.ingestion_job_id = $job_id AND $job_id IS NOT NULL)
+                       OR (c.version = $ver AND $ver IS NOT NULL)
                     DETACH DELETE c
                 """, job_id=self.job_id, ver=self.staging_version)
                 logger.info(f"✅ Đã dọn dẹp xong staging lỗi ({self.staging_version}).")
@@ -430,19 +468,24 @@ def perform_pre_swap_smoke_tests(session, staging_version: str, sample_chunk: di
 
     return True
 
-def cleanup_old_version_async(driver, old_version: str):
+def cleanup_old_version_async(neo4j_uri: str, neo4j_auth: tuple, old_version: str):
     """
-    Tiến trình dọn dẹp phiên bản cũ chạy bất đồng bộ (background thread)
-    tránh block job ingestion chính.
+    Tiến trình dọn dẹp phiên bản cũ chạy trên thread riêng VỚI DRIVER ĐỘC LẬP.
+    Tránh hoàn toàn race condition khi main thread đóng driver chính trong finally block.
     """
     def _do_cleanup():
         logger.info(f"🧹 [Background Worker] Bắt đầu dọn dẹp các node thuộc phiên bản cũ ({old_version})...")
+        bg_driver = None
         try:
-            with driver.session() as session:
+            bg_driver = GraphDatabase.driver(neo4j_uri, auth=neo4j_auth)
+            with bg_driver.session() as session:
                 session.run("MATCH (c:InternalChunk {version: $old_ver}) DETACH DELETE c", old_ver=old_version)
             logger.info(f"✅ [Background Worker] Đã hoàn thành dọn dẹp phiên bản cũ {old_version}.")
         except Exception as e:
             logger.error(f"⚠️ [Background Worker] Lỗi khi dọn dẹp phiên bản cũ {old_version}: {e}")
+        finally:
+            if bg_driver:
+                bg_driver.close()
 
     t = threading.Thread(target=_do_cleanup, daemon=False)
     t.start()
@@ -522,6 +565,9 @@ def main():
             """
 
             for batch in chunk_list(chunks, 200):
+                # Kiểm tra Fencing Token trước mỗi batch ghi (tránh ghi đè khi bị takeover sau partition)
+                if not lock_mgr.verify_ownership():
+                    raise RuntimeError("Mất quyền sở hữu Ingestion Lock do Fencing Token không khớp! Ngừng nạp batch.")
                 session.run(ingest_cypher, batch=batch)
 
             # 6. XÁC MINH 1: Tính toàn vẹn số lượng chunks (kiểm tra theo cả version và ingestion_job_id)
@@ -537,16 +583,19 @@ def main():
                 raise RuntimeError(f"Số lượng chunks nạp ({loaded_count}) không khớp dự kiến ({expected_count})")
 
             # 7. XÁC MINH 2: PRE-SWAP SMOKE TEST RETRIEVAL (Vector + Fulltext)
+            if not lock_mgr.verify_ownership():
+                raise RuntimeError("Mất quyền sở hữu Ingestion Lock trước Smoke Test!")
+
             sample_chunk = chunks[0]
             smoke_ok = perform_pre_swap_smoke_tests(session, version_tag, sample_chunk)
             if not smoke_ok:
                 raise RuntimeError("Pre-swap Smoke Test Retrieval thất bại! Indexes chưa sẵn sàng truy xuất.")
 
-            # 8. ATOMIC SWAP ACTIVE POINTER TRONG TRANSACTION
+            # 8. ATOMIC SWAP ACTIVE POINTER TRONG TRANSACTION (Có ràng buộc Fencing Token)
             logger.info("🔄 Đang thực hiện Atomic Pointer Swap chuyển active_version...")
             swap_query = """
             MATCH (s:SystemConfig {id: 'internal_rag_state'})
-            WHERE s.lock_job_id = $job_id
+            WHERE s.lock_job_id = $job_id AND s.lock_generation = $token
             SET s.previous_version = coalesce(s.active_version, 'none'),
                 s.active_version = $version,
                 s.staging_version = null,
@@ -561,22 +610,23 @@ def main():
             res = session.run(
                 swap_query, 
                 job_id=job_id,
+                token=lock_mgr.fencing_token,
                 version=version_tag, 
                 updated_at=datetime.now().isoformat(),
                 total_chunks=loaded_count
             ).single()
 
             if not res:
-                raise RuntimeError(f"Không thể swap active pointer: job_id {job_id} không còn sở hữu lock!")
+                raise RuntimeError(f"Không thể swap active pointer: job_id {job_id} hoặc fencing_token {lock_mgr.fencing_token} không còn hợp lệ!")
 
             active_ver = res["active_version"]
             prev_ver = res["previous_version"]
             logger.info(f"✅ ĐÃ CHUYỂN ACTIVE POINTER THÀNH CÔNG: active_version = '{active_ver}' (cũ: '{prev_ver}')")
             lock_mgr.stop_heartbeat()
 
-            # 9. BÀN GIAO DỌN DẸP PHIÊN BẢN CŨ SANG TIẾN TRÌNH NỀN ASYNC
+            # 9. BÀN GIAO DỌN DẸP PHIÊN BẢN CŨ SANG TIẾN TRÌNH NỀN ASYNC (Driver riêng)
             if prev_ver and prev_ver != "none" and prev_ver != version_tag:
-                cleanup_old_version_async(driver, prev_ver)
+                cleanup_old_version_async(NEO4J_URI, (NEO4J_USER, NEO4J_PASSWORD), prev_ver)
 
         logger.info("===============================================================")
         logger.info(f"🎉 HOÀN THÀNH SAFE INGESTION THÀNH CÔNG (VERSION: {version_tag})!")
