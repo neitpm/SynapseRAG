@@ -1,0 +1,27 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Cài đặt các thư viện hệ thống cần thiết (build-essential, git, libssl)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements và cài đặt python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Tải sẵn trọng số mô hình embedding all-MiniLM-L6-v2 để container khởi động tức thì
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+# Copy mã nguồn dự án
+COPY shared/ ./shared/
+COPY services/ ./services/
+COPY .env .env
+
+# Expose cổng GraphQL Gateway & SSE API
+EXPOSE 8000
+
+# Khởi chạy service Gateway
+CMD ["python", "services/rag-graphql-gateway/main.py"]

@@ -1,8 +1,6 @@
-version: '3.8'
-
 services:
   # ============================================================================
-  # 1. MESSAGE BROKER: Redpanda
+  # 1. MESSAGE BROKER: Redpanda (Kafka compatible)
   # ============================================================================
   redpanda:
     image: docker.redpanda.com/redpandadata/redpanda:v23.3.10
@@ -41,7 +39,7 @@ services:
         condition: service_healthy
 
   # ============================================================================
-  # 2. GRAPH & VECTOR DATABASE: Neo4j 5.20+ (Hỗ trợ Vector Index)
+  # 2. GRAPH & VECTOR DATABASE: Neo4j 5.20+
   # ============================================================================
   neo4j:
     image: neo4j:5.20-community
@@ -57,9 +55,14 @@ services:
       - NEO4J_server_memory_heap_max__size=1G
     volumes:
       - neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   # ============================================================================
-  # 3. RAW DATA LAKE: Cassandra (hoặc ScyllaDB tương thích CQL 100%)
+  # 3. RAW DATA LAKE: Cassandra 4.1
   # ============================================================================
   cassandra:
     image: cassandra:4.1
@@ -74,6 +77,43 @@ services:
       - HEAP_NEWSIZE=128M
     volumes:
       - cassandra_data:/var/lib/cassandra
+
+  # ============================================================================
+  # 4. BACKEND GRAPHQL GATEWAY & SSE STREAM (Query Pipeline)
+  # ============================================================================
+  rag-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: graphrag-gateway
+    ports:
+      - "8000:8000"
+    environment:
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=graphrag_password123
+      - KAFKA_BOOTSTRAP_SERVERS=redpanda:29092
+      - CASSANDRA_HOSTS=cassandra
+    env_file:
+      - .env
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+
+  # ============================================================================
+  # 5. FRONTEND 3D VISUALIZER (React + Three.js Dashboard)
+  # ============================================================================
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: graphrag-frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - rag-gateway
 
 volumes:
   redpanda_data:
