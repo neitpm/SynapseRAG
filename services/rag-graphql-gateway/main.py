@@ -941,7 +941,7 @@ def run_internal_extractive_pipeline(
             distinctive_query_terms = [w for w in key_query_terms if w not in generic_domain_words]
 
             filtered_candidates = []
-            seen_texts = set()
+            seen_content_signatures = {}
 
             for i, c in enumerate(cand_list):
                 norm_bm = (python_bm25_scores[i] - min_bm) / rng_bm
@@ -950,13 +950,13 @@ def run_internal_extractive_pipeline(
                 c["hybrid_score"] = round(0.6 * v_score + 0.4 * norm_bm, 4)
                 c["bm25_raw"] = float(python_bm25_scores[i])
 
-                # 1. Khử trùng lặp nội dung (Deduplication) theo chuỗi văn bản chuẩn hóa
-                norm_text = re.sub(r"\s+", " ", c["text"].strip().lower())
-                if norm_text in seen_texts:
-                    continue
-                seen_texts.add(norm_text)
+                # Loại bỏ các marker kỹ thuật như [FOLLOWERS:...] hoặc [tech-status:...] trước khi đánh giá và hiển thị
+                cleaned_text = re.sub(r"\[[A-Za-z0-9_\-]+:[^\]]*\]", "", c["text"])
+                cleaned_text = re.sub(r"\[DOC\-[A-Z]+\]", "", cleaned_text)
+                cleaned_text = re.sub(r"\n\s*\n", "\n", cleaned_text).strip()
+                c["text"] = cleaned_text
 
-                text_lower = c["text"].lower()
+                text_lower = cleaned_text.lower()
 
                 # 2. Bộ lọc bảo thủ MVP: Kiểm tra bằng chứng cụm từ nghiệp vụ (Concept Evidence)
                 # Tuyệt đối không dùng token đơn lẻ "ký" (tránh khớp "đăng ký")
@@ -972,18 +972,34 @@ def run_internal_extractive_pipeline(
 
                 # 3. Với các câu hỏi thông thường:
                 # Nếu câu hỏi có từ khóa đặc thù (distinctive), BẮT BUỘC chunk phải chứa ít nhất 1 từ đặc thù đó
-                # Tránh trường hợp chỉ khớp các từ chung chung như 'độ', 'phát', 'công' rồi bốc các chunk sai lệch
                 if distinctive_query_terms:
                     has_key_term = any(re.search(rf"\b{re.escape(dt)}\b", text_lower) for dt in distinctive_query_terms)
                 else:
                     has_key_term = any(re.search(rf"\b{re.escape(kt)}\b", text_lower) for kt in key_query_terms) if key_query_terms else True
 
-                # Ngưỡng vector tuyệt đối tạm thời cho MVP (Cần đánh giá lại khi có tập golden test)
-                # Lưu ý: Nếu chunk được khớp bởi BM25 Fulltext (có mặt từ khóa khớp chính xác), vector_score fallback = 0.5
-                # nên ta cho phép chunk có vector_score >= 0.65 HOẶC được tìm thấy từ BM25 (v_score == 0.5 và norm_bm >= 0.4)
                 is_strong_match = (v_score >= 0.65) or (v_score == 0.5 and norm_bm >= 0.4)
-                if is_strong_match and has_key_term:
-                    filtered_candidates.append(c)
+                if not (is_strong_match and has_key_term):
+                    continue
+
+                # 4. Khử trùng lặp nghiệp vụ & Ưu tiên nguồn:
+                # Rút trích nội dung cốt lõi: strip các nhãn trường ở đầu dòng như 'Hạng mục:', 'Vật tư / Thiết bị:', 'Ghi chú kỹ thuật:', 'Ghi chú:'
+                core_content = re.sub(r"(hạng mục|vật tư\s*/\s*thiết bị|ghi chú hiện trường|ghi chú\s*kỹ thuật|ghi chú):\s*", "", text_lower).strip()
+                core_sig = re.sub(r"\s+", " ", core_content)
+
+                # Bảng ưu tiên: tasks (nhiệm vụ công việc) > field_logs (nhật trình) > material_plans (vật tư)
+                table_priority = {"tasks": 3, "field_logs": 2, "material_plans": 1}
+                current_prio = table_priority.get(c["source_table"], 0)
+
+                if core_sig in seen_content_signatures:
+                    prev_idx, prev_prio = seen_content_signatures[core_sig]
+                    # Nếu chunk hiện tại có độ ưu tiên cao hơn chunk đã thấy -> thay thế
+                    if current_prio > prev_prio:
+                        filtered_candidates[prev_idx] = c
+                        seen_content_signatures[core_sig] = (prev_idx, current_prio)
+                    continue
+
+                seen_content_signatures[core_sig] = (len(filtered_candidates), current_prio)
+                filtered_candidates.append(c)
 
             filtered_candidates.sort(key=lambda x: x["hybrid_score"], reverse=True)
             for fc in filtered_candidates[:10]:
