@@ -20,20 +20,20 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   if (!isOpen) return null;
 
   const handleSave = () => {
-    const trimmed = inputVal.trim();
-    if (!trimmed) {
+    // Làm sạch triệt để: loại bỏ khoảng trắng, xuống dòng (\r\n) hoặc ký tự điều khiển
+    let cleaned = inputVal.trim().replace(/^bearer\s+/i, '').replace(/[\r\n\t]/g, '');
+    if (!cleaned) {
       setError('Token không được để trống.');
       return;
     }
     // Basic JWT structure validation (3 parts separated by dot)
-    const cleanToken = trimmed.startsWith('Bearer ') ? trimmed.slice(7).trim() : trimmed;
-    const parts = cleanToken.split('.');
+    const parts = cleaned.split('.');
     if (parts.length !== 3) {
       setError('Định dạng JWT không hợp lệ (cần đủ 3 phần header.payload.signature).');
       return;
     }
 
-    onSaveToken(cleanToken);
+    onSaveToken(cleaned);
     setError(null);
     onClose();
   };

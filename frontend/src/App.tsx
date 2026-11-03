@@ -185,11 +185,14 @@ export const App: React.FC = () => {
     };
 
     try {
+      // Làm sạch token: loại bỏ ký tự điều khiển, dấu cách thừa hoặc tiền tố Bearer trùng lặp
+      const cleanToken = token.trim().replace(/^bearer\s+/i, '').replace(/[\r\n\t]/g, '');
+
       // Sử dụng fetch với SSE stream để gửi kèm header Authorization: Bearer <token>
       const sseUrl = `${API_BASE}/api/debug/ask/stream?question=${encodeURIComponent(cleanText)}&top_k=3`;
       const response = await fetch(sseUrl, {
         headers: {
-          'Authorization': `Bearer ${token}`
+          'Authorization': `Bearer ${cleanToken}`
         }
       });
 
