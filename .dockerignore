@@ -1,0 +1,30 @@
+# Git & IDE
+.git
+.gitignore
+.vscode
+.idea
+
+# Node & Frontend Build Artifacts
+node_modules
+**/node_modules
+frontend/dist
+frontend/.vite
+
+# Python Virtualenv & Cache
+__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.pytest_cache
+.venv
+env/
+venv/
+
+# Large Datasets & Raw Files
+datasets/
+datasets_sanitized/
+crawled_samples/
+assets/
+
+# Environment secrets
+.env.test
