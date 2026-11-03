@@ -620,53 +620,84 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
         is_task_progress_query = any(k in q_lower for k in ["tiến độ", "tien do", "tình hình", "trạng thái", "hoàn thành chưa", "phát triển", "mới nhất"])
         
         if is_task_progress_query and not is_tech_notes_query:
-            # Tra cứu Task tính năng chấm công có cấu trúc bằng Cypher
-            cypher = """
-            MATCH (p:Project)-[:HAS_TASK]->(t:Task)
-            WHERE (toLower(t.name) CONTAINS 'chấm công' OR toLower(t.name) CONTAINS 'cham cong')
-            RETURN p.code AS project_code,
-                   p.name AS project_name,
-                   t.code AS task_code,
-                   t.name AS task_name,
-                   t.status AS status,
-                   t.progress AS progress,
-                   t.assigned_engineer_name AS assigned_engineer,
-                   t.created_at AS created_at,
-                   t.notes AS notes
-            ORDER BY t.created_at DESC
-            LIMIT 5
-            """
+            # Tra cứu Task tính năng chấm công có cấu trúc bằng Cypher kèm RBAC ngay ở database layer
+            if not auth_user.is_admin:
+                allowed_projects = list(auth_user.allowed_projects)
+                if not allowed_projects:
+                    return {
+                        "intent": "TASK_ATTENDANCE_PROGRESS",
+                        "cypher_duration_ms": 0.0,
+                        "formatted_answer": "Bạn không được cấp quyền truy cập vào dự án nào để xem tiến độ nhiệm vụ."
+                    }
+                cypher = """
+                MATCH (p:Project)-[:HAS_TASK]->(t:Task)
+                WHERE p.code IN $allowed_projects
+                  AND (toLower(t.name) CONTAINS 'chấm công' OR toLower(t.name) CONTAINS 'cham cong')
+                RETURN p.code AS project_code,
+                       p.name AS project_name,
+                       coalesce(t.code, t.id) AS task_code,
+                       t.name AS task_name,
+                       t.status AS status,
+                       t.progress AS progress,
+                       t.assigned_engineer_name AS assigned_engineer,
+                       t.created_at AS created_at,
+                       t.notes AS notes
+                ORDER BY t.created_at DESC
+                LIMIT 5
+                """
+                params = {"allowed_projects": allowed_projects}
+            else:
+                cypher = """
+                MATCH (p:Project)-[:HAS_TASK]->(t:Task)
+                WHERE (toLower(t.name) CONTAINS 'chấm công' OR toLower(t.name) CONTAINS 'cham cong')
+                RETURN p.code AS project_code,
+                       p.name AS project_name,
+                       coalesce(t.code, t.id) AS task_code,
+                       t.name AS task_name,
+                       t.status AS status,
+                       t.progress AS progress,
+                       t.assigned_engineer_name AS assigned_engineer,
+                       t.created_at AS created_at,
+                       t.notes AS notes
+                ORDER BY t.created_at DESC
+                LIMIT 5
+                """
+                params = {}
+
             c_start = time.perf_counter()
             with driver.session() as session:
-                records = list(session.run(cypher))
+                records = list(session.run(cypher, **params))
             c_dur = round((time.perf_counter() - c_start) * 1000, 2)
 
             if records:
                 lines = ["📊 **BÁO CÁO TIẾN ĐỘ TÍNH NĂNG / NHIỆM VỤ CHẤM CÔNG:**\n"]
                 for i, r in enumerate(records, 1):
-                    # Kiểm tra RBAC từng dự án
-                    if not auth_user.can_access_project(r["project_code"]):
-                        continue
                     pct = round(float(r["progress"] or 0.0) * 100, 1) if r["progress"] is not None else 0.0
                     engineer = r["assigned_engineer"].split("|")[0] if r.get("assigned_engineer") else "Chưa phân công"
                     clean_notes = re.sub(r"\[[A-Za-z0-9_\-]+:[^\]]*\]", "", r.get("notes") or "").strip()
                     note_str = f"\n   - *Ghi chú:* {clean_notes}" if clean_notes else ""
+                    task_identifier = r.get("task_code") or "N/A"
 
                     lines.append(
                         f"{i}. **{r['task_name'].strip()}**\n"
                         f"   - **Dự án:** {r['project_name']} (`{r['project_code']}`)\n"
-                        f"   - **Mã nhiệm vụ (ID):** `{r['task_code']}`\n"
+                        f"   - **Mã nhiệm vụ (ID):** `{task_identifier}`\n"
                         f"   - **Trạng thái:** `{r['status']}`\n"
                         f"   - **Tiến độ hoàn thành:** **{pct}%**\n"
                         f"   - **Nhân sự phụ trách:** {engineer}{note_str}"
                     )
-                if len(lines) > 1:
-                    lines.append("\n*(Số liệu tiến độ và trạng thái được truy xuất chính xác 100% từ thuộc tính Task trong CSDL Neo4j)*")
-                    return {
-                        "intent": "TASK_ATTENDANCE_PROGRESS",
-                        "cypher_duration_ms": c_dur,
-                        "formatted_answer": "\n".join(lines)
-                    }
+                lines.append("\n*(Số liệu tiến độ và trạng thái được truy xuất chính xác 100% từ thuộc tính Task trong CSDL Neo4j)*")
+                return {
+                    "intent": "TASK_ATTENDANCE_PROGRESS",
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": "\n".join(lines)
+                }
+            else:
+                return {
+                    "intent": "TASK_ATTENDANCE_PROGRESS",
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": "Không tìm thấy nhiệm vụ / tính năng chấm công nào trong các dự án bạn được phân quyền truy cập."
+                }
 
         # Nếu không phải hỏi tiến độ task, kiểm tra nếu là câu hỏi ghi chú kỹ thuật thì nhường cho Extractive RAG
         is_tech_notes_query = any(k in q_lower for k in ["ghi chú", "ghi chu", "kỹ thuật", "lỗi", "bug", "chi tiết", "trao đổi"])
