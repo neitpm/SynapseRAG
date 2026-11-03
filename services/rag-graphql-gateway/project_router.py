@@ -474,6 +474,132 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                     )
                 }
 
+    # -------------------------------------------------------------------------
+    # INTENT 5: Tình trạng ký kết hồ sơ / hợp đồng mua sắm
+    # -------------------------------------------------------------------------
+    contract_status_keywords = [
+        "chưa ký", "chưa được ký", "đang được ký", "đang ký", "đã ký",
+        "hồ sơ chưa ký", "hồ sơ đang ký", "hợp đồng chưa ký", "tình trạng ký",
+        "ký hợp đồng", "trình duyệt", "đang trình duyệt", "thương thảo", "phụ lục"
+    ]
+    if any(k in q_lower for k in contract_status_keywords):
+        proj_match = match_project_in_question(question, driver)
+
+        # Trường hợp 1: Hỏi cho 1 dự án cụ thể
+        if proj_match:
+            p_code, p_name = proj_match
+            if not auth_user.can_access_project(p_code):
+                return {
+                    "intent": "PERMISSION_DENIED",
+                    "cypher_duration_ms": 0.0,
+                    "formatted_answer": f"⛔ **Truy cập bị từ chối (403 Forbidden):** Tài khoản của bạn (`{auth_user.user_id}`) không được phân quyền xem tình trạng hợp đồng/hồ sơ của dự án **{p_name} ({p_code})**."
+                }
+
+            cypher = """
+            MATCH (p:Project {code: $code})-[:HAS_PURCHASE_PLAN]->(pp:PurchasingPlan)
+            WHERE pp.contract_status IS NOT NULL AND trim(pp.contract_status) <> ''
+            RETURN pp.contract_status AS status, count(pp) AS count, collect(pp.content)[0..3] AS samples
+            ORDER BY count DESC
+            """
+            c_start = time.perf_counter()
+            with driver.session() as session:
+                records = list(session.run(cypher, code=p_code))
+            c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+            if records:
+                lines = [f"📑 **Tình trạng ký kết hồ sơ / hợp đồng dự án: {p_name} ({p_code})**\n"]
+                for r in records:
+                    lines.append(f"- **{r['status']}:** {r['count']} hạng mục / gói")
+                    if r["samples"]:
+                        sample_names = ", ".join([f"`{s}`" for s in r["samples"] if s])
+                        if sample_names:
+                            lines.append(f"  *(Ví dụ: {sample_names})*")
+                return {
+                    "intent": "PROJECT_CONTRACT_STATUS",
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": "\n".join(lines)
+                }
+
+        # Trường hợp 2: Tra cứu tổng hợp toàn hệ thống (hoặc các dự án người dùng được phép xem)
+        target_status = None
+        if any(k in q_lower for k in ["chưa ký", "chưa được ký", "chưa kí"]):
+            target_status = "Chưa ký"
+        elif any(k in q_lower for k in ["đang trình duyệt", "trình duyệt"]):
+            target_status = "Đang trình duyệt"
+        elif any(k in q_lower for k in ["đang thương thảo", "thương thảo"]):
+            target_status = "Đang thương thảo"
+        elif any(k in q_lower for k in ["đã ký", "đã kí"]):
+            target_status = "Đã ký"
+
+        c_start = time.perf_counter()
+        with driver.session() as session:
+            if target_status:
+                if auth_user.role == "admin":
+                    cypher = """
+                    MATCH (p:Project)-[:HAS_PURCHASE_PLAN]->(pp:PurchasingPlan)
+                    WHERE pp.contract_status = $target_status
+                    RETURN p.code AS project_code, p.name AS project_name, count(pp) AS count, collect(pp.content)[0..3] AS samples
+                    ORDER BY count DESC
+                    """
+                    records = list(session.run(cypher, target_status=target_status))
+                else:
+                    cypher = """
+                    MATCH (p:Project)-[:HAS_PURCHASE_PLAN]->(pp:PurchasingPlan)
+                    WHERE p.code IN $allowed_projects AND pp.contract_status = $target_status
+                    RETURN p.code AS project_code, p.name AS project_name, count(pp) AS count, collect(pp.content)[0..3] AS samples
+                    ORDER BY count DESC
+                    """
+                    records = list(session.run(cypher, allowed_projects=auth_user.allowed_projects, target_status=target_status))
+            else:
+                if auth_user.role == "admin":
+                    cypher = """
+                    MATCH (p:Project)-[:HAS_PURCHASE_PLAN]->(pp:PurchasingPlan)
+                    WHERE pp.contract_status IS NOT NULL AND trim(pp.contract_status) <> ''
+                    RETURN p.code AS project_code, p.name AS project_name, pp.contract_status AS status, count(pp) AS count
+                    ORDER BY p.code, count DESC
+                    """
+                    records = list(session.run(cypher))
+                else:
+                    cypher = """
+                    MATCH (p:Project)-[:HAS_PURCHASE_PLAN]->(pp:PurchasingPlan)
+                    WHERE p.code IN $allowed_projects AND pp.contract_status IS NOT NULL AND trim(pp.contract_status) <> ''
+                    RETURN p.code AS project_code, p.name AS project_name, pp.contract_status AS status, count(pp) AS count
+                    ORDER BY p.code, count DESC
+                    """
+                    records = list(session.run(cypher, allowed_projects=auth_user.allowed_projects))
+
+        c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+        if records:
+            if target_status:
+                total_items = sum(r["count"] for r in records)
+                lines = [f"📑 **DANH SÁCH DỰ ÁN CÓ HỒ SƠ / HỢP ĐỒNG Ở TRẠNG THÁI '{target_status.upper()}':**\n"]
+                lines.append(f"*(Tìm thấy tổng cộng **{total_items}** hạng mục trên **{len(records)}** dự án)*\n")
+                for i, r in enumerate(records, 1):
+                    lines.append(f"{i}. **{r['project_name']}** (`{r['project_code']}`): **{r['count']}** hạng mục {target_status.lower()}")
+                    if r.get("samples"):
+                        samples_str = ", ".join([f"`{s}`" for s in r["samples"] if s])
+                        if samples_str:
+                            lines.append(f"   - Hạng mục tiêu biểu: {samples_str}")
+                return {
+                    "intent": "PROJECT_CONTRACT_STATUS_SYSTEM",
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": "\n".join(lines)
+                }
+            else:
+                lines = ["📑 **TỔNG HỢP TÌNH TRẠNG KÝ KẾT HỒ SƠ / HỢP ĐỒNG CÁC DỰ ÁN:**\n"]
+                curr_proj = None
+                for r in records:
+                    if curr_proj != r["project_code"]:
+                        curr_proj = r["project_code"]
+                        lines.append(f"\n- **{r['project_name']}** (`{r['project_code']}`):")
+                    lines.append(f"  + {r['status']}: {r['count']} hạng mục")
+                return {
+                    "intent": "PROJECT_CONTRACT_STATUS_SYSTEM",
+                    "cypher_duration_ms": c_dur,
+                    "formatted_answer": "\n".join(lines)
+                }
+
     return None
 
 def is_internal_query_context(question: str, driver: Driver) -> bool:
