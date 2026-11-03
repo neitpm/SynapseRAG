@@ -57,7 +57,7 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
         "bao nhiêu dự án", "số lượng dự án", "danh sách dự án", "có những dự án nào",
         "liệt kê dự án", "tổng số dự án"
     ])
-    if is_project_listing and not any(k in q_lower for k in ["chi phí", "tiến độ", "vật tư", "nhật trình", "hồ sơ", "chưa ký", "sự cố"]):
+    if is_project_listing and not any(k in q_lower for k in ["công việc", "task", "nhiệm vụ", "chi phí", "tiến độ", "vật tư", "nhật trình", "hồ sơ", "chưa ký", "sự cố"]):
         # Trích xuất bộ lọc động (Dynamic regex / entity extraction)
         # 1. Trích xuất cấp điện áp bất kỳ (ví dụ: 10kv, 10 kv, 10-kv, 110kv, 110 kV, 110-kV, 220kv, 500kv,...)
         voltage_match = re.search(r"\b(\d+)[\s\-]*kv\b", q_lower)
@@ -178,6 +178,118 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                 "cypher_duration_ms": c_dur,
                 "formatted_answer": formatted_answer
             }
+
+    # -------------------------------------------------------------------------
+    # INTENT 0.5: Thống kê tổng số lượng công việc (Task Aggregation / Count)
+    # Áp dụng RBAC ngay tại Cypher trước khi tính toán tổng số và phân nhóm theo dự án
+    # -------------------------------------------------------------------------
+    is_task_count_query = any(k in q_lower for k in [
+        "bao nhiêu công việc", "số lượng công việc", "tổng số công việc",
+        "bao nhiêu task", "số lượng task", "tổng số task",
+        "bao nhiêu nhiệm vụ", "số lượng nhiệm vụ", "tổng số nhiệm vụ"
+    ])
+    if is_task_count_query and not any(k in q_lower for k in ["chấm công", "tiến độ", "ghi chú", "chi phí", "vật tư"]):
+        proj_match = match_project_in_question(question, driver)
+
+        # Trường hợp 1: Hỏi cho 1 dự án cụ thể
+        if proj_match:
+            p_code, p_name = proj_match
+            if not auth_user.can_access_project(p_code):
+                return {
+                    "intent": "PERMISSION_DENIED",
+                    "cypher_duration_ms": 0.0,
+                    "formatted_answer": f"⛔ **Truy cập bị từ chối (403 Forbidden):** Tài khoản của bạn (`{auth_user.user_id}`) không được phân quyền xem công việc của dự án **{p_name} ({p_code})**."
+                }
+            cypher = """
+            MATCH (p:Project {code: $code})-[:HAS_TASK]->(t:Task)
+            WHERE coalesce(t.is_section_header, false) = false
+            RETURN p.name AS project_name,
+                   p.code AS project_code,
+                   count(DISTINCT t) AS total_work_tasks,
+                   count(DISTINCT CASE WHEN t.is_done = true OR t.status = 'Đã hoàn thành' OR t.status = 'Hoàn thành' THEN t ELSE null END) AS completed_tasks,
+                   count(DISTINCT CASE WHEN t.status = 'Đang làm' THEN t ELSE null END) AS in_progress_tasks,
+                   count(DISTINCT CASE WHEN t.status = 'Chưa làm' THEN t ELSE null END) AS pending_tasks
+            """
+            c_start = time.perf_counter()
+            with driver.session() as session:
+                rec = session.run(cypher, code=p_code).single()
+            c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+            if rec:
+                ans = (
+                    f"📋 **Thống kê công việc dự án: {rec['project_name']} ({p_code})**\n\n"
+                    f"- **Tổng số công việc / nhiệm vụ:** **{rec['total_work_tasks']}** công việc\n"
+                    f"  + Hoàn thành: {rec['completed_tasks']}\n"
+                    f"  + Đang thực hiện: {rec['in_progress_tasks']}\n"
+                    f"  + Chưa thực hiện: {rec['pending_tasks']}\n\n"
+                    f"*(Số liệu được đếm chính xác trên từng node Task riêng biệt `count(DISTINCT t)`, loại trừ tiêu đề mục)*"
+                )
+            else:
+                ans = f"Dự án **{p_name} ({p_code})** hiện chưa có công việc nào được ghi nhận."
+            return {
+                "intent": "PROJECT_TASK_COUNT",
+                "cypher_duration_ms": c_dur,
+                "formatted_answer": ans
+            }
+
+        # Trường hợp 2: Hỏi cho tất cả dự án (toàn hệ thống hoặc trong phạm vi phân quyền)
+        if not auth_user.is_admin:
+            allowed_projects = list(auth_user.allowed_projects)
+            if not allowed_projects:
+                return {
+                    "intent": "TOTAL_TASK_COUNT_RBAC",
+                    "cypher_duration_ms": 0.0,
+                    "formatted_answer": "Bạn không được cấp quyền truy cập vào dự án nào để thống kê công việc."
+                }
+            cypher = """
+            MATCH (p:Project)-[:HAS_TASK]->(t:Task)
+            WHERE p.code IN $allowed_projects
+              AND coalesce(t.is_section_header, false) = false
+            RETURN p.code AS project_code,
+                   p.name AS project_name,
+                   count(DISTINCT t) AS task_count
+            ORDER BY task_count DESC
+            """
+            params = {"allowed_projects": allowed_projects}
+        else:
+            cypher = """
+            MATCH (p:Project)-[:HAS_TASK]->(t:Task)
+            WHERE coalesce(t.is_section_header, false) = false
+            RETURN p.code AS project_code,
+                   p.name AS project_name,
+                   count(DISTINCT t) AS task_count
+            ORDER BY task_count DESC
+            """
+            params = {}
+
+        c_start = time.perf_counter()
+        with driver.session() as session:
+            records = list(session.run(cypher, **params))
+        c_dur = round((time.perf_counter() - c_start) * 1000, 2)
+
+        total_tasks = sum(r["task_count"] for r in records)
+        if auth_user.is_admin:
+            header = f"📋 **Tổng số công việc trên toàn bộ hệ thống:** **{total_tasks:,}** công việc\n"
+            scope_note = "*(Quyền Quản trị viên: Thống kê toàn bộ các dự án trong hệ thống)*"
+        else:
+            header = f"📋 **Tổng số công việc trong các dự án bạn được phân quyền:** **{total_tasks:,}** công việc\n"
+            scope_note = f"*(Tài khoản: `{auth_user.user_id}` - Phân quyền trên {len(records)} dự án)*"
+
+        lines = [header]
+        if records:
+            lines.append("**Chi tiết số lượng công việc theo từng dự án:**")
+            for r in records:
+                lines.append(f"- **{r['project_name']}** (`{r['project_code']}`): {r['task_count']} công việc")
+            lines.append(f"\n{scope_note}")
+            lines.append("*(Số liệu tính toán qua `count(DISTINCT t)` trên node Task, loại trừ các task là tiêu đề mục)*")
+        else:
+            lines.append("Hiện chưa có công việc nào được ghi nhận trong phạm vi dự án của bạn.")
+
+        return {
+            "intent": "TOTAL_TASK_COUNT",
+            "cypher_duration_ms": c_dur,
+            "formatted_answer": "\n".join(lines)
+        }
 
     # -------------------------------------------------------------------------
     # INTENT 1: Tiến độ trung bình các task (loại trừ section header, quy đổi 0-1 sang %)
