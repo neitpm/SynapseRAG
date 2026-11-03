@@ -600,6 +600,34 @@ def execute_structured_query(question: str, driver: Driver, auth_user: Any) -> O
                     "formatted_answer": "\n".join(lines)
                 }
 
+    # -------------------------------------------------------------------------
+    # INTENT 6: Dữ liệu Chấm công / Điểm danh nhân sự (Timesheet / Attendance)
+    # Tách biệt rõ ràng giữa "Bảng chấm công nhân viên" và "Task phát triển phần mềm"
+    # -------------------------------------------------------------------------
+    attendance_keywords = [
+        "chấm công", "cham cong", "điểm danh", "diem danh",
+        "bảng công", "bang cong", "ngày công", "ngay cong",
+        "nhân viên nào chấm công", "ai chấm công", "ai cham cong"
+    ]
+    if any(k in q_lower for k in attendance_keywords):
+        # Nếu câu hỏi nói rõ về tính năng, phát triển, task, lỗi, phần mềm liên quan đến chấm công
+        # -> Để cho Extractive RAG nội bộ truy xuất các task trong PHAN_MEM_CONG_TY
+        software_task_keywords = ["tính năng", "chức năng", "phần mềm", "lỗi", "task", "tiến độ", "phát triển", "triển khai", "form", "kế toán gửi"]
+        is_software_inquiry = any(sk in q_lower for sk in software_task_keywords)
+
+        if not is_software_inquiry:
+            # Câu hỏi tra cứu dữ liệu chấm công thực tế của nhân viên (ai chấm công, bảng công hôm nay...)
+            return {
+                "intent": "HR_ATTENDANCE_NOT_INDEXED",
+                "cypher_duration_ms": 0.0,
+                "formatted_answer": (
+                    "ℹ️ **Thông báo về nguồn dữ liệu:**\n\n"
+                    "Hiện tại hệ thống **chưa tích hợp nguồn dữ liệu chấm công / điểm danh nhân sự (Timesheet/Attendance)**.\n\n"
+                    "- Cơ sở dữ liệu hiện tại chỉ quản lý thông tin dự án, kế hoạch mua sắm vật tư, chi phí và tiến độ nhiệm vụ công việc.\n"
+                    "- Nếu bạn đang tìm kiếm các **nhiệm vụ kỹ thuật / phát triển tính năng chấm công** (thuộc dự án Phần mềm công ty), vui lòng nêu rõ: *'Tiến độ phát triển tính năng chấm công'*."
+                )
+            }
+
     return None
 
 def is_internal_query_context(question: str, driver: Driver) -> bool:
@@ -614,6 +642,7 @@ def is_internal_query_context(question: str, driver: Driver) -> bool:
         "nhật trình", "hiện trường", "công trường", "sự cố", "phát sinh",
         "ghi chú", "quy cách", "tiêu chuẩn kỹ thuật", "vật tư", "kế hoạch",
         "hạng mục", "joint box", "odf", "tiến độ", "chi phí", "hạch toán",
-        "dự án", "công trình", "hợp đồng", "gói thầu"
+        "dự án", "công trình", "hợp đồng", "gói thầu", "chấm công", "điểm danh",
+        "bảng công", "ngày công", "nhân sự", "phân công"
     ]
     return any(k in q_lower for k in internal_keywords)
