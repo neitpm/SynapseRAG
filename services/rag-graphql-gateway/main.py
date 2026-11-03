@@ -818,7 +818,9 @@ def run_internal_extractive_pipeline(
     retrieval_start = time.perf_counter()
 
     query_words = re.findall(r"\w+", question.lower())
-    ft_query_str = " OR ".join([w for w in query_words if len(w) > 1]) if query_words else question
+    # Làm sạch từ khóa để tạo chuỗi Lucene an toàn (chỉ chứa ký tự chữ và số)
+    sanitized_words = [re.sub(r"[^a-zA-Z0-9_\u00C0-\u1EF9]", "", w) for w in query_words if len(w) > 1]
+    ft_query_str = " OR ".join(sanitized_words) if sanitized_words else "du_an"
     # Overfetch lớn trên Neo4j 5.20 để bù đắp việc xếp hạng toàn cục trước khi Cypher lọc
     fetch_k = max(top_k * 15, 150)
 
@@ -859,9 +861,9 @@ def run_internal_extractive_pipeline(
                 "active_version": active_version
             }).data()
 
-            # Cypher Fulltext Query có điều kiện RBAC & Active Version ngay tại DB
-            fulltext_rbac_cypher = """
-            CALL db.index.fulltext.queryNodes('internal_chunk_fulltext_index', $ft_query)
+            # Cypher Fulltext Query: Sử dụng chuỗi Lucene đã sanitize trực tiếp để tương thích với Neo4j 5.20 procedure
+            fulltext_rbac_cypher = f"""
+            CALL db.index.fulltext.queryNodes('internal_chunk_fulltext_index', '{ft_query_str}')
             YIELD node, score
             WHERE ($is_admin = true OR node.project_code IN $allowed_list)
               AND ($target_code IS NULL OR node.project_code = $target_code)
@@ -878,7 +880,6 @@ def run_internal_extractive_pipeline(
             ft_res = []
             try:
                 ft_res = session.run(fulltext_rbac_cypher, {
-                    "ft_query": ft_query_str,
                     "fetch_k": fetch_k,
                     "is_admin": is_admin,
                     "allowed_list": allowed_list,
@@ -933,13 +934,18 @@ def run_internal_extractive_pipeline(
 
             # Từ khóa dừng (stop words) không mang bằng chứng nghiệp vụ cốt lõi
             stop_terms = {"dự", "án", "nào", "đang", "có", "các", "những", "cho", "của", "với", "được", "trong", "là", "bị", "ở", "tại"}
+            # Các từ chung chung, xuất hiện trong hầu hết các công việc/thiết bị công trường
+            generic_domain_words = {"tiến", "độ", "phát", "triển", "tính", "năng", "công", "việc", "hạng", "mục", "vật", "tư", "thiết", "bị"}
             key_query_terms = [w for w in query_words if len(w) > 1 and w not in stop_terms]
+            # Từ khóa đặc thù (distinctive): không nằm trong stop words và không nằm trong các từ chung chung
+            distinctive_query_terms = [w for w in key_query_terms if w not in generic_domain_words]
 
             filtered_candidates = []
             seen_texts = set()
 
             for i, c in enumerate(cand_list):
                 norm_bm = (python_bm25_scores[i] - min_bm) / rng_bm
+                c["norm_bm"] = round(norm_bm, 4)
                 v_score = c["vector_score"]
                 c["hybrid_score"] = round(0.6 * v_score + 0.4 * norm_bm, 4)
                 c["bm25_raw"] = float(python_bm25_scores[i])
@@ -964,15 +970,24 @@ def run_internal_extractive_pipeline(
                         # Từ chối dứt khoát nếu không có bằng chứng ký duyệt nghiệp vụ
                         continue
 
-                # 3. Với các câu hỏi thông thường: Kiểm tra ranh giới từ (word boundary) cho các từ khóa cốt lõi
-                # Khớp ranh giới từ để 'ký' không khớp trong 'đăng ký', 'án' không khớp trong 'dự án'
-                has_key_term = any(re.search(rf"\b{re.escape(kt)}\b", text_lower) for kt in key_query_terms) if key_query_terms else True
+                # 3. Với các câu hỏi thông thường:
+                # Nếu câu hỏi có từ khóa đặc thù (distinctive), BẮT BUỘC chunk phải chứa ít nhất 1 từ đặc thù đó
+                # Tránh trường hợp chỉ khớp các từ chung chung như 'độ', 'phát', 'công' rồi bốc các chunk sai lệch
+                if distinctive_query_terms:
+                    has_key_term = any(re.search(rf"\b{re.escape(dt)}\b", text_lower) for dt in distinctive_query_terms)
+                else:
+                    has_key_term = any(re.search(rf"\b{re.escape(kt)}\b", text_lower) for kt in key_query_terms) if key_query_terms else True
 
                 # Ngưỡng vector tuyệt đối tạm thời cho MVP (Cần đánh giá lại khi có tập golden test)
-                if v_score >= 0.65 and has_key_term:
+                # Lưu ý: Nếu chunk được khớp bởi BM25 Fulltext (có mặt từ khóa khớp chính xác), vector_score fallback = 0.5
+                # nên ta cho phép chunk có vector_score >= 0.65 HOẶC được tìm thấy từ BM25 (v_score == 0.5 và norm_bm >= 0.4)
+                is_strong_match = (v_score >= 0.65) or (v_score == 0.5 and norm_bm >= 0.4)
+                if is_strong_match and has_key_term:
                     filtered_candidates.append(c)
 
             filtered_candidates.sort(key=lambda x: x["hybrid_score"], reverse=True)
+            for fc in filtered_candidates[:10]:
+                logger.info(f"🔎 [cand] {fc['chunk_id'][:30]} | hybrid: {fc['hybrid_score']} | v: {fc['vector_score']} | norm_bm: {fc.get('norm_bm')}")
             final_chunks = filtered_candidates[:top_k]
         else:
             final_chunks = []
