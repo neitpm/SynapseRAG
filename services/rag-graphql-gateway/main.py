@@ -929,7 +929,7 @@ def run_internal_extractive_pipeline(
 
             # Nhận diện các ý định nghiệp vụ đặc thù (Business Concept Intent) từ câu hỏi
             q_clean = question.lower()
-            is_signing_status_query = any(p in q_clean for p in ["chưa ký", "chưa được ký", "đã ký", "ký duyệt", "phê duyệt", "chưa duyệt"])
+            is_signing_status_query = any(p in q_clean for p in ["chưa ký", "chưa được ký", "đã ký", "được ký", "đang ký", "ký duyệt", "phê duyệt", "chưa duyệt", "kí duyệt"])
 
             # Từ khóa dừng (stop words) không mang bằng chứng nghiệp vụ cốt lõi
             stop_terms = {"dự", "án", "nào", "đang", "có", "các", "những", "cho", "của", "với", "được", "trong", "là", "bị", "ở", "tại"}
